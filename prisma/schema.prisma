@@ -1,0 +1,609 @@
+// STS CHSD complication abstraction platform — relational model.
+// Identifiers (MRN, CSN, NOTE_ID) are stored as TEXT exactly as received.
+// Vector columns use pgvector via Unsupported(); they are read/written with raw SQL.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+  // rhel-openssl-3.0.x = Vercel serverless runtime
+  binaryTargets   = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
+}
+
+enum Role {
+  ADMIN
+  REVIEWER
+  READ_ONLY
+}
+
+enum DataClassification {
+  SYNTHETIC
+  DEIDENTIFIED
+  PHI
+}
+
+enum SourceFileKind {
+  CLINICAL_NOTES
+  HISTORICAL_COMPLICATIONS
+  STS_MANUAL
+}
+
+enum SourceFileStatus {
+  UPLOADED
+  VALIDATED
+  IMPORTED
+  FAILED
+}
+
+enum SourceRowStatus {
+  VALID
+  INVALID
+  DUPLICATE
+}
+
+enum SurgeryDateSource {
+  UNKNOWN
+  DERIVED_FROM_OP_NOTE
+  MANUAL
+}
+
+enum ManualStatus {
+  UPLOADED
+  INDEXING
+  INDEXED
+  APPROVED
+  RETIRED
+  FAILED
+  REJECTED
+}
+
+enum ClassificationStatus {
+  SUGGESTED // confirmed event per AI, awaiting human review
+  SUSPECTED // AI saw a possible event; needs review
+  INSUFFICIENT_EVIDENCE
+  CONFLICTING_EVIDENCE
+  EXCLUDED // AI considered and excluded (negated / historical / planned / out of window)
+  REVIEWER_ADDED
+}
+
+enum ReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CORRECTED
+  NEEDS_REVIEW
+}
+
+enum ReviewDecisionType {
+  APPROVE
+  REJECT
+  CORRECT
+  ADD_MISSING
+  NEEDS_REVIEW
+}
+
+enum ExampleQuality {
+  VERIFIED
+  PENDING_VERIFICATION
+  CONFLICTING_EVIDENCE
+  INSUFFICIENT_EVIDENCE
+}
+
+enum ExampleSource {
+  HISTORICAL_IMPORT
+  REVIEWER_FEEDBACK
+}
+
+enum ExampleLibraryStatus {
+  CANDIDATE
+  APPROVED
+  REJECTED
+  RETIRED
+}
+
+enum EvaluationCohort {
+  DEVELOPMENT
+  HOLDOUT
+  INDEPENDENT_TEST
+}
+
+enum JobType {
+  CLASSIFICATION
+  MANUAL_INDEXING
+  HISTORICAL_PREP
+  EVALUATION
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  PAUSED
+  COMPLETED
+  COMPLETED_WITH_ERRORS
+  FAILED
+  CANCELLED
+}
+
+enum JobItemStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+  SKIPPED
+}
+
+model User {
+  id          String    @id @default(cuid())
+  email       String    @unique
+  name        String?
+  entraOid    String?   @unique
+  role        Role      @default(READ_ONLY)
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  lastLoginAt DateTime?
+
+  reviews        ReviewDecision[]
+  auditLogs      AuditLog[]
+  uploadedFiles  SourceFile[]
+  jobs           ProcessingJob[]
+  approvedManual ManualVersion[]
+}
+
+model SourceFile {
+  id                 String             @id @default(cuid())
+  fileName           String
+  fileType           String
+  kind               SourceFileKind
+  dataClassification DataClassification
+  sha256             String?
+  sizeBytes          Int
+  /// File bytes live in Postgres (Vercel has no persistent filesystem). Assembled from chunks.
+  content            Bytes?
+  expectedChunks     Int
+  uploadComplete     Boolean            @default(false)
+  sheetName          String?
+  columnMapping      Json?
+  importReport       Json?
+  status             SourceFileStatus   @default(UPLOADED)
+  uploadedById       String?
+  uploadedBy         User?              @relation(fields: [uploadedById], references: [id])
+  createdAt          DateTime           @default(now())
+  importedAt         DateTime?
+
+  rows               SourceRow[]
+  notes              ClinicalNote[]
+  historicalExamples HistoricalExample[]
+  jobs               ProcessingJob[]
+  chunks             UploadChunk[]
+  manualVersions     ManualVersion[]
+
+  @@index([sha256])
+}
+
+/// Upload chunk (<4 MB each) to stay under serverless request-body limits; deleted after assembly.
+model UploadChunk {
+  id           String     @id @default(cuid())
+  sourceFileId String
+  sourceFile   SourceFile @relation(fields: [sourceFileId], references: [id], onDelete: Cascade)
+  index        Int
+  bytes        Bytes
+
+  @@unique([sourceFileId, index])
+}
+
+/// One row of an uploaded spreadsheet, preserved verbatim for note-level export.
+model SourceRow {
+  id             String          @id @default(cuid())
+  sourceFileId   String
+  sourceFile     SourceFile      @relation(fields: [sourceFileId], references: [id], onDelete: Cascade)
+  rowNumber      Int
+  raw            Json
+  status         SourceRowStatus
+  issues         Json?
+  clinicalNoteId String?
+  clinicalNote   ClinicalNote?   @relation(fields: [clinicalNoteId], references: [id])
+
+  @@unique([sourceFileId, rowNumber])
+  @@index([clinicalNoteId])
+}
+
+model Patient {
+  id         String      @id @default(cuid())
+  mrn        String      @unique
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  encounters Encounter[]
+}
+
+model Encounter {
+  id                String            @id @default(cuid())
+  patientId         String
+  patient           Patient           @relation(fields: [patientId], references: [id])
+  csn               String
+  admissionDate     DateTime?
+  surgeryDate       DateTime?
+  surgeryDateSource SurgeryDateSource @default(UNKNOWN)
+  dischargeDate     DateTime?
+  createdAt         DateTime          @default(now())
+
+  notes              ClinicalNote[]
+  predictions        ComplicationPrediction[]
+  historicalExamples HistoricalExample[]
+  jobItems           JobItem[]
+  cacheEntries       ClassificationCache[]
+
+  @@unique([patientId, csn])
+  @@index([csn])
+}
+
+model ClinicalNote {
+  id               String    @id @default(cuid())
+  encounterId      String
+  encounter        Encounter @relation(fields: [encounterId], references: [id])
+  noteId           String
+  noteType         String?
+  dateOfService    DateTime?
+  dateOfServiceRaw String?
+  filedDate        DateTime?
+  combinedNoteText String
+  contentHash      String
+  sourceFileId     String?
+  sourceFile       SourceFile? @relation(fields: [sourceFileId], references: [id])
+  sourceFlag       String?
+  createdAt        DateTime  @default(now())
+
+  sourceRows SourceRow[]
+  evidence   PredictionEvidence[]
+  passages   NotePassage[]
+
+  // NOTE_ID alone is not unique in source extracts (revisions share an ID).
+  @@unique([encounterId, noteId, contentHash])
+  @@index([noteId])
+  @@index([contentHash])
+  @@index([encounterId, dateOfService])
+}
+
+/// Optional embedded passage of a clinical note (only when external embedding of notes is authorized).
+model NotePassage {
+  id             String                       @id @default(cuid())
+  clinicalNoteId String
+  clinicalNote   ClinicalNote                 @relation(fields: [clinicalNoteId], references: [id], onDelete: Cascade)
+  start          Int
+  end            Int
+  embeddingModel String
+  embedding      Unsupported("vector(1536)")?
+
+  @@index([clinicalNoteId])
+}
+
+model ManualVersion {
+  id               String       @id @default(cuid())
+  version          String       @unique
+  title            String?
+  fileName         String
+  sha256           String
+  sourceFileId     String
+  sourceFile       SourceFile   @relation(fields: [sourceFileId], references: [id])
+  pageCount        Int?
+  detectedVersion  String?
+  identityCheck    Json?
+  effectiveFrom    DateTime?
+  effectiveTo      DateTime?
+  isDefault        Boolean      @default(false)
+  status           ManualStatus @default(UPLOADED)
+  embeddingModel   String?
+  approvedById     String?
+  approvedBy       User?        @relation(fields: [approvedById], references: [id])
+  approvedAt       DateTime?
+  createdAt        DateTime     @default(now())
+
+  rules       STSManualRule[]
+  predictions ComplicationPrediction[]
+}
+
+model STSManualRule {
+  id                  String        @id @default(cuid())
+  manualVersionId     String
+  manualVersionRef    ManualVersion @relation(fields: [manualVersionId], references: [id], onDelete: Cascade)
+  manualVersion       String
+  sectionName         String?
+  pageNumber          Int
+  pageEnd             Int?
+  longName            String?
+  shortName           String?
+  seqNumber           String?
+  dbTable             String?
+  stsCode             String?
+  complicationName    String?
+  definition          String?
+  intentClarification String?
+  codingInstructions  String?
+  validCodes          Json?
+  parentConditions    String?
+  inclusionExclusion  String?
+  specialNotes        String?
+  chunkText           String
+  isComplicationRule  Boolean       @default(false)
+  embedding           Unsupported("vector(1536)")?
+  createdAt           DateTime      @default(now())
+
+  predictions        ComplicationPrediction[]
+  historicalExamples HistoricalExample[]
+
+  @@index([manualVersionId])
+  @@index([stsCode])
+}
+
+model ComplicationPrediction {
+  id                    String               @id @default(cuid())
+  encounterId           String
+  encounter             Encounter            @relation(fields: [encounterId], references: [id])
+  jobId                 String?
+  job                   ProcessingJob?       @relation(fields: [jobId], references: [id])
+  predictedComplication String
+  stsCode               String?
+  complicationEventDate DateTime?
+  classificationStatus  ClassificationStatus
+  eventAssertion        String?
+  evidenceStatus        String
+  reviewStatus          ReviewStatus         @default(PENDING)
+  finalComplication     String?
+  finalStsCode          String?
+  confidenceScore       Float?
+  uncertainty           String?
+  clinicalEvidence      String?
+  aiExplanation         String?
+  validationIssues      Json?
+  manualReferenceId     String?
+  manualReference       STSManualRule?       @relation(fields: [manualReferenceId], references: [id])
+  manualVersionId       String?
+  manualVersion         ManualVersion?       @relation(fields: [manualVersionId], references: [id])
+  manualPage            Int?
+  manualSection         String?
+  modelVersion          String?
+  promptVersion         String?
+  exampleLibraryVersion Int?
+  escalated             Boolean              @default(false)
+  cacheKey              String?
+  supersededAt          DateTime?
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+
+  evidence        PredictionEvidence[]
+  reviews         ReviewDecision[]
+  trainingExample HistoricalExample[]
+
+  @@index([encounterId])
+  @@index([reviewStatus])
+  @@index([predictedComplication])
+}
+
+model PredictionEvidence {
+  id             String                 @id @default(cuid())
+  predictionId   String
+  prediction     ComplicationPrediction @relation(fields: [predictionId], references: [id], onDelete: Cascade)
+  clinicalNoteId String
+  clinicalNote   ClinicalNote           @relation(fields: [clinicalNoteId], references: [id])
+  evidenceText   String
+  evidenceStart  Int?
+  evidenceEnd    Int?
+  evidenceType   String
+  verified       Boolean                @default(false)
+
+  @@index([predictionId])
+  @@index([clinicalNoteId])
+}
+
+/// Append-only. The prediction's current reviewStatus mirrors the latest decision.
+model ReviewDecision {
+  id                    String                 @id @default(cuid())
+  predictionId          String
+  prediction            ComplicationPrediction @relation(fields: [predictionId], references: [id])
+  reviewerId            String
+  reviewer              User                   @relation(fields: [reviewerId], references: [id])
+  decision              ReviewDecisionType
+  previousStatus        ReviewStatus
+  correctedComplication String?
+  correctedStsCode      String?
+  comments              String?
+  reviewedAt            DateTime               @default(now())
+
+  @@index([predictionId, reviewedAt])
+}
+
+model HistoricalExample {
+  id                String               @id @default(cuid())
+  encounterId       String?
+  encounter         Encounter?           @relation(fields: [encounterId], references: [id])
+  sourceFileId      String?
+  sourceFile        SourceFile?          @relation(fields: [sourceFileId], references: [id])
+  sourceRowNumber   Int?
+  source            ExampleSource        @default(HISTORICAL_IMPORT)
+  mrn               String
+  csn               String
+  dateOfService     DateTime?
+  dateOfServiceRaw  String?
+  originalLabel     String
+  complication      String
+  noteInfo          String?
+  keyWords          String?
+  additionalInfo    String?
+  clinicalEvidence  String?
+  supportingNoteIds String[]
+  candidateNoteIds  String[]
+  quality           ExampleQuality       @default(PENDING_VERIFICATION)
+  qualityReason     String?
+  libraryStatus     ExampleLibraryStatus @default(CANDIDATE)
+  cohort            EvaluationCohort     @default(DEVELOPMENT)
+  validated         Boolean              @default(false)
+  reviewerId        String?
+  reviewedAt        DateTime?
+  stsRuleId         String?
+  stsRule           STSManualRule?       @relation(fields: [stsRuleId], references: [id])
+  predictionId      String?
+  prediction        ComplicationPrediction? @relation(fields: [predictionId], references: [id])
+  embeddingModel    String?
+  embedding         Unsupported("vector(1536)")?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  @@index([encounterId])
+  @@index([quality, libraryStatus])
+}
+
+/// Snapshot of approved example IDs; activating an older version is a rollback.
+model ExampleLibraryVersion {
+  id          String   @id @default(cuid())
+  version     Int      @unique
+  exampleIds  String[]
+  notes       String?
+  active      Boolean  @default(false)
+  createdById String?
+  createdAt   DateTime @default(now())
+}
+
+model PromptVersion {
+  id           String   @id @default(cuid())
+  version      String   @unique
+  systemPrompt String
+  notes        String?
+  active       Boolean  @default(false)
+  createdById  String?
+  createdAt    DateTime @default(now())
+}
+
+model ProcessingJob {
+  id               String     @id @default(cuid())
+  type             JobType
+  fileName         String?
+  sourceFileId     String?
+  sourceFile       SourceFile? @relation(fields: [sourceFileId], references: [id])
+  manualVersionId  String?
+  processingStatus JobStatus  @default(QUEUED)
+  totalRecords     Int        @default(0)
+  processedRecords Int        @default(0)
+  failedRecords    Int        @default(0)
+  errors           Json?
+  params           Json?
+  result           Json?
+  currentModel     String?
+  inputTokens      Int        @default(0)
+  outputTokens     Int        @default(0)
+  cachedTokens     Int        @default(0)
+  tokenUsage       Int        @default(0)
+  estimatedCost    Float?
+  actualCost       Float?
+  createdById      String?
+  createdBy        User?      @relation(fields: [createdById], references: [id])
+  /// Lease so that only one serverless invocation processes a job at a time.
+  lockedUntil      DateTime?
+  lockOwner        String?
+  lastTickAt       DateTime?
+  createdAt        DateTime   @default(now())
+  startedAt        DateTime?
+  completedAt      DateTime?
+
+  items       JobItem[]
+  predictions ComplicationPrediction[]
+  aiCalls     AiCall[]
+
+  @@index([processingStatus])
+}
+
+model JobItem {
+  id          String        @id @default(cuid())
+  jobId       String
+  job         ProcessingJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  encounterId String?
+  encounter   Encounter?    @relation(fields: [encounterId], references: [id])
+  refId       String?
+  status      JobItemStatus @default(PENDING)
+  attempts    Int           @default(0)
+  error       String?
+  costUsd     Float?
+  escalated   Boolean       @default(false)
+  cacheHit    Boolean       @default(false)
+  updatedAt   DateTime      @updatedAt
+
+  @@unique([jobId, encounterId])
+  @@index([jobId, status])
+}
+
+model AiCall {
+  id                String         @id @default(cuid())
+  jobId             String?
+  job               ProcessingJob? @relation(fields: [jobId], references: [id])
+  encounterId       String?
+  purpose           String
+  model             String
+  reasoningEffort   String?
+  inputTokens       Int            @default(0)
+  cachedInputTokens Int            @default(0)
+  outputTokens      Int            @default(0)
+  reasoningTokens   Int            @default(0)
+  costUsd           Float?
+  durationMs        Int
+  retries           Int            @default(0)
+  success           Boolean
+  errorCode         String?
+  createdAt         DateTime       @default(now())
+
+  @@index([createdAt])
+  @@index([jobId])
+}
+
+model ClassificationCache {
+  id            String    @id @default(cuid())
+  cacheKey      String    @unique
+  encounterId   String
+  encounter     Encounter @relation(fields: [encounterId], references: [id])
+  model         String
+  promptVersion String
+  manualVersion String
+  result        Json
+  createdAt     DateTime  @default(now())
+  invalidatedAt DateTime?
+}
+
+model EvaluationRun {
+  id              String           @id @default(cuid())
+  name            String
+  model           String
+  promptVersion   String?
+  manualVersion   String?
+  cohort          EvaluationCohort
+  libraryVersion  Int?
+  jobId           String?
+  metrics         Json?
+  results         Json?
+  status          JobStatus        @default(QUEUED)
+  createdById     String?
+  createdAt       DateTime         @default(now())
+  completedAt     DateTime?
+}
+
+model AppSetting {
+  key       String   @id
+  value     Json
+  updatedBy String?
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id])
+  action     String
+  entityType String
+  entityId   String?
+  timestamp  DateTime @default(now())
+  metadata   Json?
+
+  @@index([entityType, entityId])
+  @@index([timestamp])
+}

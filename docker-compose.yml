@@ -1,0 +1,34 @@
+# Local database for the STS Clinical Classification app.
+# The Next.js app itself runs on the host (npm run dev -> http://localhost:3000)
+# and is deployed to Vercel in production; Docker provides only PostgreSQL + pgvector.
+#
+#   cp .env.example .env        # set POSTGRES_PASSWORD and matching DATABASE_URL
+#   docker compose up -d        # start db
+#   npm run db:migrate          # apply Prisma migrations
+#   npm run dev
+
+name: sts-classification
+
+services:
+  db:
+    image: pgvector/pgvector:0.8.1-pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    # Bound to localhost only; never published on public interfaces.
+    ports:
+      - "127.0.0.1:${DB_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  postgres_data:
