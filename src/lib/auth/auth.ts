@@ -6,6 +6,13 @@ import { prisma } from "@/lib/db/prisma";
 import { env, entraConfigured, devLoginAllowed } from "@/lib/env";
 import { mapEntraRoles } from "@/lib/auth/roles";
 import { audit } from "@/lib/audit";
+import { log } from "@/lib/security/logger";
+
+/** Prisma error code (P1001 = DB unreachable, P2021 = table missing, …) when present. */
+function prismaCode(err: unknown): string | undefined {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "string" ? code : undefined;
+}
 
 declare module "next-auth" {
   interface Session {
@@ -36,12 +43,17 @@ function buildProviders(): NextAuthConfig["providers"] {
           const role = String(creds?.role ?? "") as Role;
           if (!ROLES.includes(role) || !devLoginAllowed()) return null;
           const email = `${role.toLowerCase().replace("_", "-")}@dev.local`;
-          const user = await prisma.user.upsert({
-            where: { email },
-            create: { email, name: `Dev ${role}`, role },
-            update: { role, lastLoginAt: new Date() },
-          });
-          return { id: user.id, email: user.email, name: user.name };
+          try {
+            const user = await prisma.user.upsert({
+              where: { email },
+              create: { email, name: `Dev ${role}`, role },
+              update: { role, lastLoginAt: new Date() },
+            });
+            return { id: user.id, email: user.email, name: user.name };
+          } catch (err) {
+            log.error("dev-login user upsert failed", err, { role, code: prismaCode(err) });
+            throw err;
+          }
         },
       }),
     );
@@ -54,6 +66,13 @@ export const authConfig: NextAuthConfig = {
   session: { strategy: "jwt", maxAge: env().SESSION_MAX_AGE_SECONDS },
   pages: { signIn: "/sign-in" },
   trustHost: true,
+  logger: {
+    // Auth.js wraps the real failure (DB error, missing secret, …) in `cause.err`.
+    error(error) {
+      const cause = (error as { cause?: { err?: unknown } }).cause?.err;
+      log.error(`auth ${error.name}`, cause ?? error, { code: prismaCode(cause) });
+    },
+  },
   callbacks: {
     async jwt({ token, account, profile, user }) {
       if (account?.provider === "microsoft-entra-id" && profile) {

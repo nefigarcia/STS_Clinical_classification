@@ -1,4 +1,5 @@
-import { redirect } from "next/navigation";
+import { redirect, unstable_rethrow } from "next/navigation";
+import { log } from "@/lib/security/logger";
 import { HeartPulse, ShieldAlert, LogIn } from "lucide-react";
 import { signIn } from "@/lib/auth/auth";
 import { currentUser } from "@/lib/auth/guard";
@@ -33,7 +34,7 @@ export default async function SignInPage({ searchParams }: PageProps<"/sign-in">
         <CardContent className="space-y-4">
           {sp.error && (
             <p role="alert" className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">
-              Sign-in failed. Your account may not be authorized.
+              Sign-in failed ({String(sp.error)}). Your account may not be authorized, or the server could not complete sign-in.
             </p>
           )}
           {entra && (
@@ -64,7 +65,13 @@ export default async function SignInPage({ searchParams }: PageProps<"/sign-in">
                 className="grid grid-cols-3 gap-2"
                 action={async (fd: FormData) => {
                   "use server";
-                  await signIn("dev-login", { role: String(fd.get("role")), redirectTo: callbackUrl });
+                  try {
+                    await signIn("dev-login", { role: String(fd.get("role")), redirectTo: callbackUrl });
+                  } catch (err) {
+                    unstable_rethrow(err); // signIn succeeds by throwing a redirect
+                    log.error("dev-login sign-in failed", err, { route: "/sign-in" });
+                    redirect(`/sign-in?error=${encodeURIComponent(err instanceof Error ? err.name : "SignInError")}`);
+                  }
                 }}
               >
                 {(["ADMIN", "REVIEWER", "READ_ONLY"] as const).map((r) => (

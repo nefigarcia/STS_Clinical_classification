@@ -39,7 +39,14 @@ let cached: AppEnv | null = null;
 export function env(): AppEnv {
   if (!cached || process.env.NODE_ENV === "test") {
     const blankToUndefined = Object.fromEntries(Object.entries(process.env).map(([k, v]) => [k, v === "" ? undefined : v]));
-    cached = schema.parse(blankToUndefined);
+    const parsed = schema.safeParse(blankToUndefined);
+    if (!parsed.success) {
+      // Name the offending variables (never their values) so the deploy logs say what to fix.
+      const detail = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
+      console.error(`Invalid environment configuration — ${detail}`);
+      throw new Error(`Invalid environment configuration — ${detail}`);
+    }
+    cached = parsed.data;
   }
   return cached;
 }
