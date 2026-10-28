@@ -69,8 +69,8 @@ export const authConfig: NextAuthConfig = {
   logger: {
     // Auth.js wraps the real failure (DB error, missing secret, …) in `cause.err`.
     error(error) {
-      const cause = (error as { cause?: { err?: unknown } }).cause?.err;
-      log.error(`auth ${error.name}`, cause ?? error, { code: prismaCode(cause) });
+      const { cause, type } = error as { cause?: { err?: unknown }; type?: string };
+      log.error(`auth ${type ?? error.name}`, cause?.err ?? error, { code: prismaCode(cause?.err) });
     },
   },
   callbacks: {

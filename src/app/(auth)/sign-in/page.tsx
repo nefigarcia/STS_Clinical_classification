@@ -9,6 +9,12 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 
 export const dynamic = "force-dynamic";
 
+/** Auth.js errors carry a stable `type`; class names are minified in production builds. */
+function authErrorType(err: unknown): string {
+  const type = (err as { type?: unknown } | null)?.type;
+  return typeof type === "string" ? type : "SignInError";
+}
+
 function safeCallback(v: string | string[] | undefined) {
   const s = Array.isArray(v) ? v[0] : v;
   return s && s.startsWith("/") && !s.startsWith("//") ? s : "/dashboard";
@@ -70,7 +76,7 @@ export default async function SignInPage({ searchParams }: PageProps<"/sign-in">
                   } catch (err) {
                     unstable_rethrow(err); // signIn succeeds by throwing a redirect
                     log.error("dev-login sign-in failed", err, { route: "/sign-in" });
-                    redirect(`/sign-in?error=${encodeURIComponent(err instanceof Error ? err.name : "SignInError")}`);
+                    redirect(`/sign-in?error=${encodeURIComponent(authErrorType(err))}`);
                   }
                 }}
               >
