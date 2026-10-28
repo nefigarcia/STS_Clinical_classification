@@ -267,7 +267,7 @@ Do not use live PHI in GitHub, Copilot prompts, or any unapproved tool.
 
 1. Provision an **approved** PostgreSQL with `vector` and `pg_trgm` available, then run `npm run db:migrate` against it from CI or a trusted machine.
 2. Set every environment variable in Vercel Project Settings: `APP_ENV=production`, `AUTH_URL` set to your domain, the Entra variables, `CRON_SECRET`, the OpenAI variables, and `PHI_EXTERNAL_AI_APPROVED` (only after approval).
-3. `vercel.json` schedules `/api/cron/process-jobs` every minute. Per-minute cron requires a paid Vercel plan; on Hobby, jobs still run through `after()` self-chaining.
+3. `vercel.json` schedules `/api/cron/process-jobs` once a day (06:00 UTC) as a safety-net sweep, which fits the Hobby plan. Jobs normally run through `after()` self-chaining. On Pro you can change the schedule to `* * * * *` so stuck jobs are picked up faster.
 4. Long-running routes declare `maxDuration` (≤ 300 s). Enable Fluid Compute or raise the plan limits if needed.
 5. If Deployment Protection is on, set `VERCEL_AUTOMATION_BYPASS_SECRET` so job self-chaining can reach the API.
 
