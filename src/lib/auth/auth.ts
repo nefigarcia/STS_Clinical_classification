@@ -10,7 +10,9 @@ import { log } from "@/lib/security/logger";
 
 /** Prisma error code (P1001 = DB unreachable, P2021 = table missing, …) when present. */
 function prismaCode(err: unknown): string | undefined {
-  const code = (err as { code?: unknown } | null)?.code;
+  // Known request errors use `code`; initialization errors (e.g. unreachable DB) use `errorCode`.
+  const e = err as { code?: unknown; errorCode?: unknown } | null;
+  const code = e?.code ?? e?.errorCode;
   return typeof code === "string" ? code : undefined;
 }
 

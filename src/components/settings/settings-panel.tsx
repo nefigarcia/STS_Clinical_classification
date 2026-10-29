@@ -5,7 +5,8 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { toast } from "sonner";
-import { CheckCircle2, Loader2, ShieldCheck, XCircle } from "lucide-react";
+import { CheckCircle2, Loader2, ShieldCheck, Trash2, TriangleAlert, XCircle } from "lucide-react";
+import { useApi } from "@/hooks/use-api";
 import { api } from "@/lib/client/fetch";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -15,6 +16,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { NativeSelectClass, formatDate } from "@/components/common";
 
 type Settings = {
+  pipeline: { screeningMode: "full" | "lexicon"; consistencyRuns: number; eventFieldSeqNos: string[]; screenChunkChars: number; maxPassagesPerCode: number };
   processingLimits: {
     maxJobTokenBudget: number;
     maxEncounterCostUsd: number;
@@ -180,6 +182,7 @@ export function SettingsPanel({ isAdmin }: { isAdmin: boolean }) {
         </Card>
       </div>
 
+      <PipelineCard value={s.pipeline} disabled={!isAdmin} onSave={(v) => save("pipeline", v)} />
       <LimitsCard value={s.processingLimits} disabled={!isAdmin} onSave={(v) => save("processingLimits", v)} />
 
       <div className="grid gap-4 lg:grid-cols-2">
@@ -216,10 +219,10 @@ export function SettingsPanel({ isAdmin }: { isAdmin: boolean }) {
         </Card>
         <Card>
           <CardHeader>
-            <CardTitle>Escalation triggers</CardTitle>
+            <CardTitle>High-risk codes</CardTitle>
             <CardDescription>
-              Predictions whose label contains any of these terms are treated as high-risk and may be sent to the escalation model, within the escalation-rate
-              cap.
+              STS events whose name contains any of these terms always get at least two independent adjudication runs; any disagreement goes to the escalation
+              model (within the escalation-rate cap) and to human review.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -231,6 +234,7 @@ export function SettingsPanel({ isAdmin }: { isAdmin: boolean }) {
       {isAdmin && <UsersCard />}
       <VersionsCard isAdmin={isAdmin} />
       {isAdmin && <AuditCard />}
+      {isAdmin && <ResetCard />}
     </div>
   );
 }
@@ -665,6 +669,209 @@ function AuditCard() {
             Next
           </Button>
         </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function PipelineCard({ value, disabled, onSave }: { value: Settings["pipeline"]; disabled: boolean; onSave: (v: Settings["pipeline"]) => void }) {
+  const [v, setV] = useState(value);
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Classification pipeline</CardTitle>
+        <CardDescription>
+          Full screening checks every note in the STS window against all event codes (audit-grade recall; higher cost). Each flagged code is then judged against
+          its STS checklist; with 2+ consistency runs, any disagreement is sent to the escalation model and always to human review.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+        <div className="space-y-1">
+          <Label htmlFor="sm">Screening</Label>
+          <select
+            id="sm"
+            className={`${NativeSelectClass} w-full`}
+            disabled={disabled}
+            value={v.screeningMode}
+            onChange={(e) => setV({ ...v, screeningMode: e.target.value as "full" | "lexicon" })}
+          >
+            <option value="full">Full — every note (recommended)</option>
+            <option value="lexicon">Keyword passages only (cheaper, lower recall)</option>
+          </select>
+        </div>
+        <div className="space-y-1">
+          <Label htmlFor="cr">Consistency runs</Label>
+          <Input
+            id="cr"
+            type="number"
+            min={1}
+            max={3}
+            disabled={disabled}
+            value={v.consistencyRuns}
+            onChange={(e) => setV({ ...v, consistencyRuns: Number(e.target.value) })}
+          />
+        </div>
+        <div className="space-y-1">
+          <Label htmlFor="ef">Event field SeqNo(s)</Label>
+          <Input
+            id="ef"
+            disabled={disabled}
+            value={v.eventFieldSeqNos.join(", ")}
+            onChange={(e) =>
+              setV({
+                ...v,
+                eventFieldSeqNos: e.target.value
+                  .split(",")
+                  .map((s) => s.trim())
+                  .filter(Boolean),
+              })
+            }
+          />
+        </div>
+        <div className="space-y-1">
+          <Label htmlFor="cc">Screen chunk (chars)</Label>
+          <Input
+            id="cc"
+            type="number"
+            disabled={disabled}
+            value={v.screenChunkChars}
+            onChange={(e) => setV({ ...v, screenChunkChars: Number(e.target.value) })}
+          />
+        </div>
+        <div className="space-y-1">
+          <Label htmlFor="mp">Max passages per code</Label>
+          <Input
+            id="mp"
+            type="number"
+            disabled={disabled}
+            value={v.maxPassagesPerCode}
+            onChange={(e) => setV({ ...v, maxPassagesPerCode: Number(e.target.value) })}
+          />
+        </div>
+        {!disabled && (
+          <div className="sm:col-span-2 lg:col-span-5">
+            <Button size="sm" onClick={() => onSave(v)}>
+              Save pipeline
+            </Button>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+type ResetCounts = {
+  predictions: number;
+  reviewDecisions: number;
+  reviewerFeedbackExamples: number;
+  classificationCache: number;
+  jobs: number;
+  aiCalls: number;
+  evaluationRuns: number;
+  screeningCache: number | null;
+  runningJobs: number;
+};
+
+/** Testing aid: wipe AI classification results so encounters can be re-classified from zero. */
+function ResetCard() {
+  const [open, setOpen] = useState(false);
+  const [screening, setScreening] = useState(false);
+  const [typed, setTyped] = useState("");
+  const [busy, setBusy] = useState(false);
+  const { data, reload } = useApi<{ allowed: boolean; counts: ResetCounts }>(open ? `/api/admin/reset?screening=${screening ? 1 : 0}` : null);
+
+  async function reset() {
+    setBusy(true);
+    try {
+      await api("/api/admin/reset", { method: "POST", json: { confirm: typed, includeScreeningCache: screening } });
+      toast.success("Classification data reset. Notes, STS manual, historical labels and the audit log were kept.");
+      setTyped("");
+      setOpen(false);
+    } catch (e) {
+      toast.error((e as Error).message);
+      reload();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const c = data?.counts;
+  const rows: [string, number | null | undefined][] = c
+    ? [
+        ["AI predictions (with evidence)", c.predictions],
+        ["Reviewer decisions", c.reviewDecisions],
+        ["Reviewer-feedback candidate examples", c.reviewerFeedbackExamples],
+        ["Cached encounter classifications", c.classificationCache],
+        ["Classification / evaluation jobs", c.jobs],
+        ["AI usage records", c.aiCalls],
+        ["Evaluation runs", c.evaluationRuns],
+        ...(screening ? ([["Note screening cache entries", c.screeningCache]] as [string, number | null][]) : []),
+      ]
+    : [];
+
+  return (
+    <Card className="border-rose-200">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-rose-700">
+          <TriangleAlert className="size-5" aria-hidden /> Danger zone — reset classification data
+        </CardTitle>
+        <CardDescription>
+          For testing: delete all AI classification results so encounters can be classified again from zero. Patients, encounters, notes, uploaded files, the
+          STS manual, historical labels, users, settings and the audit log are kept. The reset itself is audited. Disabled in production.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {!open ? (
+          <Button variant="outline" className="border-rose-300 text-rose-700 hover:bg-rose-50" onClick={() => setOpen(true)}>
+            <Trash2 aria-hidden /> Reset classification data…
+          </Button>
+        ) : !data ? (
+          <p className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="size-4 animate-spin" aria-hidden /> Counting…
+          </p>
+        ) : !data.allowed ? (
+          <p className="text-sm text-rose-700">Reset is disabled in production (APP_ENV=production).</p>
+        ) : (
+          <div className="space-y-3 rounded-lg border border-rose-200 bg-rose-50/40 p-3">
+            <table className="w-full max-w-md text-sm">
+              <caption className="mb-1 text-left text-xs font-medium text-muted-foreground">This will permanently delete:</caption>
+              <tbody>
+                {rows.map(([k, v]) => (
+                  <tr key={k} className="border-t">
+                    <td className="py-1">{k}</td>
+                    <td className="text-right tabular-nums">{v ?? 0}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <label className="flex items-start gap-2 text-sm">
+              <input type="checkbox" className="mt-1" checked={screening} onChange={(e) => setScreening(e.target.checked)} />
+              <span>
+                Also delete the note screening cache
+                <span className="block text-xs text-muted-foreground">
+                  Forces every note to be read again by the AI on the next run (higher cost). Leave unchecked to re-run only the per-code decisions.
+                </span>
+              </span>
+            </label>
+            {c && c.runningJobs > 0 && (
+              <p className="text-sm font-medium text-rose-700">{c.runningJobs} job(s) are queued or running — cancel them in AI Processing first.</p>
+            )}
+            <div className="space-y-1">
+              <Label htmlFor="reset-confirm">
+                Type <span className="font-mono font-semibold">RESET</span> to confirm
+              </Label>
+              <Input id="reset-confirm" className="max-w-48" value={typed} onChange={(e) => setTyped(e.target.value)} autoComplete="off" />
+            </div>
+            <div className="flex gap-2">
+              <Button variant="destructive" disabled={typed !== "RESET" || busy || (c?.runningJobs ?? 0) > 0} onClick={reset}>
+                {busy ? <Loader2 className="animate-spin" aria-hidden /> : <Trash2 aria-hidden />} Delete classification data
+              </Button>
+              <Button variant="ghost" onClick={() => (setOpen(false), setTyped(""))}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        )}
       </CardContent>
     </Card>
   );

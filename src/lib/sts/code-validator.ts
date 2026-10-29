@@ -2,10 +2,14 @@ import { prisma } from "@/lib/db/prisma";
 
 export type AllowedCode = { code: string; name: string; ruleId: string; page: number; section: string | null };
 
-/** All STS codes present in the indexed manual version. Codes absent from the manual are never accepted. */
+/**
+ * Complication/event codes present in the indexed manual version. STS codes are only unique within a
+ * field (e.g. preoperative-factor codes reuse numbers), so only complication/event fields are accepted.
+ */
 export async function allowedCodes(manualVersionId: string): Promise<Map<string, AllowedCode>> {
   const rules = await prisma.sTSManualRule.findMany({
-    where: { manualVersionId, stsCode: { not: null } },
+    where: { manualVersionId, stsCode: { not: null }, isComplicationRule: true },
+    orderBy: { pageNumber: "asc" },
     select: { id: true, stsCode: true, complicationName: true, pageNumber: true, sectionName: true },
   });
   const map = new Map<string, AllowedCode>();

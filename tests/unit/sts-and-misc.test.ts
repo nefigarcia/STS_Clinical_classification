@@ -8,12 +8,14 @@ import { scrub } from "@/lib/security/logger";
 import { mostRestrictive } from "@/lib/security/gates";
 import { verifySignature, typeFromName } from "@/lib/storage";
 
-// Synthetic manual-like text in a labelled-field layout (TEST FIXTURE, not STS content).
+// Synthetic text in the CHSD Training Manual layout (TEST FIXTURE: made-up fields and codes, not STS content).
+const hdr = (n: number) => `CHSD Training Manual - Version 9.9.9 Page ${n} of 5`;
 const fixturePages = [
-  "Society of Thoracic Surgeons\nCongenital Heart Surgery Database\nTraining Manual\nVersion 9.9.9",
-  "POSTOPERATIVE EVENTS\nLong Name: Test Postoperative Complication\nShort Name: TestComp\nSeq. #: 1234\nTable: TestOps\nDefinition: Indicate the test complication that occurred.\nIntent/Clarification: Code only events within the test window.\nThis clarification continues on the next line.",
-  "1 = Test event alpha\n2 = Test event beta\nNote: fixture note text.",
-  "OTHER SECTION\nSome general paragraph that is long enough to be indexed as a loose chunk of text for testing search coverage across sections in the parser.",
+  "CONGENITAL HEART\nSURGERY DATABASE\nTRAINING MANUAL\nVERSION 9.9.9\nSociety of Thoracic Surgeons",
+  `${hdr(2)}\nS9. TEST POSTOPERATIVE EVENTS\nLong Name: Test Postoperative Events - Multi-Select\nSeqNo: 1234\nShort Name: TestPostopEvents\nDatabase Table Name: TestOps\nData Source: User\nFormat: Multi-Select\nDefinition: Indicate the test complication that occurred.\nParentLongName: Test Parent\nParentHarvestCodes: 2\nHarvest Codes and Display Conditions:\nCode: Value (Display Condition):\n11 Test event alpha requiring
+drainage (TEST)\n12 Test event beta`,
+  `${hdr(3)}\nIntent/Clarification:\nCode only events within the test window.\nThis clarification continues on the next line.\nCode: Value: Definition:\n11 Test event alpha\nrequiring drainage\n(TEST)\nDefined: alpha fixture definition.\nTimeframe:\n12 hours after the test.\nCode this Event: when alpha occurs.\n12 Test event beta Defined: beta fixture definition on the value line.`,
+  `${hdr(4)}\nGeneral Information Test Timeframes\nSome general paragraph that is long enough to be indexed as a loose chunk of text for testing search coverage across sections in the parser.`,
 ];
 
 describe("STS manual identity check", () => {
@@ -30,33 +32,40 @@ describe("STS manual identity check", () => {
 
 describe("rule parser", () => {
   const rules = parseManual(fixturePages);
-  const field = rules.find((r) => r.longName === "Test Postoperative Complication" && !r.stsCode)!;
+  const field = rules.find((r) => r.seqNumber === "1234" && !r.stsCode)!;
   it("keeps a field's definition and its clarification in one chunk with page numbers", () => {
     expect(field).toBeDefined();
+    expect(field.longName).toBe("Test Postoperative Events - Multi-Select");
     expect(field.definition).toMatch(/test complication/);
     expect(field.intentClarification).toMatch(/continues on the next line/);
     expect(field.chunkText).toMatch(/Definition/);
     expect(field.chunkText).toMatch(/Intent\/Clarification/);
+    expect(field.chunkText).not.toMatch(/Page 2 of 5/); // page furniture removed
     expect(field.pageNumber).toBe(2);
     expect(field.pageEnd).toBe(3);
-    expect(field.shortName).toBe("TestComp");
-    expect(field.seqNumber).toBe("1234");
-    expect(field.sectionName).toBe("POSTOPERATIVE EVENTS");
+    expect(field.shortName).toBe("TestPostopEvents");
+    expect(field.dbTable).toBe("TestOps");
+    expect(field.parentConditions).toMatch(/ParentHarvestCodes: 2/);
+    expect(field.sectionName).toBe("S9. TEST POSTOPERATIVE EVENTS");
     expect(field.isComplicationRule).toBe(true);
   });
-  it("extracts coded values into code-level rules", () => {
+  it("extracts wrapped harvest codes and pairs each code with its own definition", () => {
     expect(field.validCodes).toEqual([
-      { code: "1", value: "Test event alpha" },
-      { code: "2", value: "Test event beta" },
+      { code: "11", value: "Test event alpha requiring drainage (TEST)" },
+      { code: "12", value: "Test event beta" },
     ]);
     const coded = rules.filter((r) => r.stsCode);
-    expect(coded.map((r) => [r.stsCode, r.complicationName])).toEqual([
-      ["1", "Test event alpha"],
-      ["2", "Test event beta"],
+    expect(coded.map((r) => [r.stsCode, r.complicationName, r.pageNumber])).toEqual([
+      ["11", "Test event alpha requiring drainage (TEST)", 3],
+      ["12", "Test event beta", 3],
     ]);
+    // "Timeframe: 12 hours…" must not be mistaken for entry 12.
+    expect(coded[0].definition).toMatch(/^Defined: alpha fixture definition\.[\s\S]*Timeframe:\n12 hours[\s\S]*Code this Event: when alpha occurs\.$/);
+    expect(coded[1].definition).toBe("Defined: beta fixture definition on the value line.");
+    expect(coded[0].chunkText).toMatch(/SeqNo: 1234/);
   });
-  it("indexes loose section text", () => {
-    expect(rules.some((r) => r.sectionName === "OTHER SECTION")).toBe(true);
+  it("treats 'General Information' pages as their own section", () => {
+    expect(rules.some((r) => r.sectionName === "General Information Test Timeframes" && !r.longName)).toBe(true);
   });
   it("parses Code/Value pairs", () => {
     expect(extractCodes("Code: 12 Value: Foo bar")).toEqual([{ code: "12", value: "Foo bar" }]);

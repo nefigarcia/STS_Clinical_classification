@@ -22,7 +22,9 @@
     "inspect:reference": "tsx scripts/inspect-reference-files.ts",
     "import:reference": "tsx scripts/import-reference-data.ts",
     "seed:synthetic": "tsx scripts/seed-synthetic-data.ts",
-    "validate:historical": "tsx scripts/validate-historical-examples.ts"
+    "validate:historical": "tsx scripts/validate-historical-examples.ts",
+    "load:manual": "tsx scripts/load-sts-manual.ts",
+    "reset:classifications": "tsx scripts/reset-classifications.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",

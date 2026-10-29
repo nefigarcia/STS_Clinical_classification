@@ -5,7 +5,21 @@ import { useApi } from "@/hooks/use-api";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { AlertTriangle, ArrowLeft, BookOpen, ChevronLeft, ChevronRight, FileText, Loader2, RefreshCw, ShieldQuestion, Sparkles } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowLeft,
+  CircleCheck,
+  CircleHelp,
+  CircleX,
+  BookOpen,
+  ChevronLeft,
+  ChevronRight,
+  FileText,
+  Loader2,
+  RefreshCw,
+  ShieldQuestion,
+  Sparkles,
+} from "lucide-react";
 import { api } from "@/lib/client/fetch";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -24,6 +38,14 @@ type Evidence = {
   evidenceType: string;
   clinicalNote: { noteId: string; noteType: string | null; dateOfService: string | null };
 };
+type CriterionView = {
+  id: string;
+  kind: "defined" | "code_this_event" | "exclusion";
+  text: string;
+  effectiveStatus: "met" | "not_met" | "unclear";
+  evidence: { noteId: string; excerpt: string }[];
+  rationale: string;
+};
 type Prediction = PanelPrediction & {
   classificationStatus: string;
   eventAssertion: string | null;
@@ -35,6 +57,9 @@ type Prediction = PanelPrediction & {
   uncertainty: string | null;
   aiExplanation: string | null;
   validationIssues: string[] | null;
+  criteriaResults: CriterionView[] | null;
+  timeframeCheck: { status: string; window: string; classes: string | null; eventDate: string | null; eventDateSource: string } | null;
+  agreement: string | null;
   modelVersion: string | null;
   promptVersion: string | null;
   escalated: boolean;
@@ -52,7 +77,17 @@ type Prediction = PanelPrediction & {
   evidence: Evidence[];
 };
 type Detail = {
-  encounter: { id: string; mrn: string; csn: string; surgeryDate: string | null; surgeryDateSource: string };
+  encounter: {
+    id: string;
+    mrn: string;
+    csn: string;
+    surgeryDate: string | null;
+    surgeryDateSource: string;
+    orExitAt: string | null;
+    dischargeDate: string | null;
+    dischargeDateSource: string;
+    databaseDischargeDate: string | null;
+  };
   notes: { id: string; noteId: string; noteType: string | null; dateOfService: string | null; length: number; sourceFlag: string | null }[];
   predictions: Prediction[];
   examples: { id: string; complication: string; clinicalEvidence: string | null }[];
@@ -102,10 +137,10 @@ export function ReviewWorkspace({ encounterId, canReview, back }: { encounterId:
     }
   }
 
-  async function saveSurgeryDate(v: string) {
+  async function saveDate(field: "surgeryDate" | "orExitAt" | "dischargeDate" | "databaseDischargeDate", v: string) {
     try {
-      await api(`/api/patients/${encounterId}`, { method: "PATCH", json: { surgeryDate: v || null } });
-      toast.success("Surgery date confirmed");
+      await api(`/api/patients/${encounterId}`, { method: "PATCH", json: { [field]: v || null } });
+      toast.success("Encounter date saved — re-run AI to apply it to the STS timeframe");
       load();
     } catch (e) {
       toast.error((e as Error).message);
@@ -145,31 +180,8 @@ export function ReviewWorkspace({ encounterId, canReview, back }: { encounterId:
             <dt className="inline text-muted-foreground">CSN </dt>
             <dd className="inline font-mono font-medium">{detail.encounter.csn}</dd>
           </div>
-          <div className="flex items-center gap-1.5">
-            <dt className="text-muted-foreground">Surgery date</dt>
-            <dd>
-              {canReview ? (
-                <Input
-                  type="date"
-                  className="h-7 w-36"
-                  defaultValue={detail.encounter.surgeryDate?.slice(0, 10) ?? ""}
-                  onBlur={(e) => e.target.value !== (detail.encounter.surgeryDate?.slice(0, 10) ?? "") && saveSurgeryDate(e.target.value)}
-                  aria-label="Surgery date"
-                />
-              ) : (
-                formatDate(detail.encounter.surgeryDate)
-              )}
-            </dd>
-            {detail.encounter.surgeryDateSource !== "MANUAL" && (
-              <span
-                className="rounded bg-amber-100 px-1.5 text-[11px] text-amber-900"
-                title="Derived from the earliest operative note; selects the STS manual version"
-              >
-                {detail.encounter.surgeryDateSource === "UNKNOWN" ? "unknown" : "derived — confirm"}
-              </span>
-            )}
-          </div>
         </dl>
+        <EncounterDates encounter={detail.encounter} canEdit={canReview} onSave={saveDate} />
         <div className="ml-auto flex flex-wrap items-center gap-2">
           {canReview && (
             <>
@@ -344,7 +356,7 @@ function PredictionCard({
   examples: Detail["examples"];
 }) {
   const unverified = p.evidence.filter((e) => !e.verified).length;
-  const incomplete = p.evidence.length === 0 || unverified > 0 || (p.validationIssues?.length ?? 0) > 0 || p.evidenceStatus !== "supported";
+  const incomplete = p.evidence.length === 0 || unverified > 0 || (p.validationIssues?.length ?? 0) > 0 || p.reviewStatus === "NEEDS_REVIEW";
   return (
     <article
       onClick={onSelect}
@@ -375,11 +387,17 @@ function PredictionCard({
           <StatusBadge status={p.classificationStatus} />
         </div>
       </div>
-      {incomplete && p.classificationStatus !== "EXCLUDED" && (
-        <p className="mt-2 flex items-start gap-1.5 rounded-md bg-amber-50 p-2 text-xs text-amber-900">
+      {incomplete && (
+        <p
+          className={cn(
+            "mt-2 flex items-start gap-1.5 rounded-md p-2 text-xs",
+            p.classificationStatus === "EXCLUDED" ? "bg-slate-100 text-slate-700" : "bg-amber-50 text-amber-900",
+          )}
+        >
           <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden />
           <span>
-            Evidence incomplete: {p.evidence.length === 0 ? "no source evidence. " : ""}
+            {p.classificationStatus === "EXCLUDED" ? "Why not coded: " : "Needs attention: "}
+            {p.evidence.length === 0 && p.classificationStatus !== "EXCLUDED" ? "no verified source evidence. " : ""}
             {unverified > 0 ? `${unverified} excerpt(s) not found verbatim in the note. ` : ""}
             {(p.validationIssues ?? []).join("; ")}
           </span>
@@ -404,6 +422,25 @@ function PredictionCard({
         </ul>
       )}
       {p.aiExplanation && <p className="mt-2 text-sm">{p.aiExplanation}</p>}
+      {p.timeframeCheck && (
+        <p className="mt-2 text-xs">
+          <span className="font-medium">STS timeframe ({p.timeframeCheck.classes ?? "n/a"}): </span>
+          <TimeframeBadge status={p.timeframeCheck.status} /> event {p.timeframeCheck.eventDate ?? "date unknown"}
+          <span className="text-muted-foreground">
+            {" "}
+            ({p.timeframeCheck.eventDateSource}) · window {p.timeframeCheck.window}
+          </span>
+        </p>
+      )}
+      {p.agreement && (
+        <p className="mt-1 text-xs">
+          <span className="font-medium">Consistency: </span>
+          <span className={p.agreement.startsWith("split") ? "font-medium text-rose-700" : ""}>{p.agreement}</span>
+        </p>
+      )}
+      {p.criteriaResults && p.criteriaResults.length > 0 && (
+        <CriteriaChecklist criteria={p.criteriaResults} defaultOpen={p.classificationStatus !== "EXCLUDED"} />
+      )}
       <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
         {p.manualReference ? (
           <Link
@@ -442,5 +479,126 @@ function PredictionCard({
         </details>
       )}
     </article>
+  );
+}
+
+const CRITERION_LABEL = { defined: "Defined", code_this_event: "Code this Event", exclusion: "Exclusion" } as const;
+
+/** Per-criterion answers against the STS checklist; the decision was computed from these in code. */
+function CriteriaChecklist({ criteria, defaultOpen }: { criteria: CriterionView[]; defaultOpen: boolean }) {
+  const icon = (c: CriterionView) => {
+    // For exclusions "met" means the exclusion applies (bad for coding).
+    const good = c.kind === "exclusion" ? c.effectiveStatus === "not_met" : c.effectiveStatus === "met";
+    if (c.effectiveStatus === "unclear") return <CircleHelp className="size-3.5 text-amber-600" aria-label="unclear" />;
+    return good ? (
+      <CircleCheck className="size-3.5 text-emerald-600" aria-label="satisfied" />
+    ) : (
+      <CircleX className="size-3.5 text-rose-600" aria-label="not satisfied" />
+    );
+  };
+  const label = (c: CriterionView) =>
+    c.kind === "exclusion"
+      ? c.effectiveStatus === "met"
+        ? "applies"
+        : c.effectiveStatus === "not_met"
+          ? "does not apply"
+          : "unclear"
+      : c.effectiveStatus.replace("_", " ");
+  return (
+    <details className="mt-2 rounded-md border bg-slate-50 text-xs" open={defaultOpen} onClick={(e) => e.stopPropagation()}>
+      <summary className="cursor-pointer px-2 py-1.5 font-medium">STS criteria checklist ({criteria.length})</summary>
+      <ul className="space-y-1.5 px-2 pb-2">
+        {criteria.map((c) => (
+          <li key={c.id} className="rounded bg-white p-1.5">
+            <div className="flex items-start gap-1.5">
+              <span className="mt-0.5">{icon(c)}</span>
+              <span>
+                <span className="font-semibold">
+                  {c.id} {CRITERION_LABEL[c.kind]} — {label(c)}
+                </span>
+                <span className="block text-muted-foreground">{c.text.length > 260 ? `${c.text.slice(0, 260)}…` : c.text}</span>
+                {c.rationale && <span className="block italic">{c.rationale}</span>}
+                {c.evidence.map((e, i) => (
+                  <span key={i} className="mt-0.5 block border-l-2 border-amber-400 pl-1.5">
+                    “{e.excerpt}” <span className="text-muted-foreground">(NOTE_ID {e.noteId})</span>
+                  </span>
+                ))}
+              </span>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+function TimeframeBadge({ status }: { status: string }) {
+  const style: Record<string, string> = {
+    in_window: "bg-emerald-50 text-emerald-700 ring-emerald-300",
+    before_window: "bg-rose-50 text-rose-700 ring-rose-300",
+    after_window: "bg-rose-50 text-rose-700 ring-rose-300",
+    unverifiable: "bg-amber-50 text-amber-800 ring-amber-300",
+  };
+  return <span className={cn("rounded-full px-1.5 py-0.5 ring-1 ring-inset", style[status] ?? "")}>{status.replace("_", " ")}</span>;
+}
+
+type DateField = "surgeryDate" | "orExitAt" | "dischargeDate" | "databaseDischargeDate";
+
+/** Encounter dates that drive the deterministic STS timeframe (and manual version selection). */
+function EncounterDates({ encounter, canEdit, onSave }: { encounter: Detail["encounter"]; canEdit: boolean; onSave: (f: DateField, v: string) => void }) {
+  const fields: { key: DateField; label: string; type: "date" | "datetime-local"; value: string | null; derived?: string }[] = [
+    {
+      key: "surgeryDate",
+      label: "Index operation",
+      type: "date",
+      value: encounter.surgeryDate?.slice(0, 10) ?? null,
+      derived: encounter.surgeryDateSource === "MANUAL" ? undefined : encounter.surgeryDateSource === "UNKNOWN" ? "unknown" : "derived — confirm",
+    },
+    {
+      key: "orExitAt",
+      label: "OR exit",
+      type: "datetime-local",
+      value: encounter.orExitAt?.slice(0, 16) ?? null,
+      derived: encounter.orExitAt ? undefined : "unknown",
+    },
+    {
+      key: "dischargeDate",
+      label: "Hospital discharge",
+      type: "date",
+      value: encounter.dischargeDate?.slice(0, 10) ?? null,
+      derived: encounter.dischargeDate ? (encounter.dischargeDateSource === "MANUAL" ? undefined : "derived") : "unknown",
+    },
+    {
+      key: "databaseDischargeDate",
+      label: "Database discharge",
+      type: "date",
+      value: encounter.databaseDischargeDate?.slice(0, 10) ?? null,
+      derived: encounter.databaseDischargeDate ? undefined : "unknown",
+    },
+  ];
+  return (
+    <dl className="flex w-full flex-wrap items-center gap-x-4 gap-y-1 border-t pt-2 text-xs" aria-label="Encounter dates for the STS timeframe">
+      {fields.map((f) => (
+        <div key={f.key} className="flex items-center gap-1.5">
+          <dt className="text-muted-foreground">{f.label}</dt>
+          <dd>
+            {canEdit ? (
+              <Input
+                type={f.type}
+                className={cn("h-7", f.type === "date" ? "w-36" : "w-48")}
+                defaultValue={f.value ?? ""}
+                onBlur={(e) => e.target.value !== (f.value ?? "") && onSave(f.key, e.target.value)}
+                aria-label={f.label}
+              />
+            ) : f.type === "date" ? (
+              formatDate(f.value)
+            ) : (
+              (f.value?.replace("T", " ") ?? "—")
+            )}
+          </dd>
+          {f.derived && <span className="rounded bg-amber-100 px-1.5 text-[11px] text-amber-900">{f.derived}</span>}
+        </div>
+      ))}
+    </dl>
   );
 }

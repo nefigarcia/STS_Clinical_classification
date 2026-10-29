@@ -70,6 +70,11 @@ export async function complicationLevelRows(f: Filters = {}) {
       Response: p.aiExplanation ?? "",
       "Evidence Status": p.evidenceStatus,
       "Validation Issues": Array.isArray(p.validationIssues) ? (p.validationIssues as string[]).join("; ") : "",
+      "STS Criteria": Array.isArray(p.criteriaResults)
+        ? (p.criteriaResults as { id: string; effectiveStatus: string }[]).map((c) => `${c.id}:${c.effectiveStatus}`).join(" ")
+        : "",
+      "STS Timeframe": p.timeframeCheck ? `${(p.timeframeCheck as { status: string }).status}` : "",
+      "Model Agreement": p.agreement ?? "",
       "Model Version": p.modelVersion ?? "",
       "Prompt Version": p.promptVersion ?? "",
       "Manual Reference": manualRef(p),

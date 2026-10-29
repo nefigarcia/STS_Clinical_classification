@@ -228,7 +228,13 @@ model Encounter {
   admissionDate     DateTime?
   surgeryDate       DateTime?
   surgeryDateSource SurgeryDateSource @default(UNKNOWN)
+  /// OR exit date/time of the index operation (STS postoperative timeframe start).
+  orExitAt          DateTime?
+  /// Hospital discharge date of the surgical hospitalization.
   dischargeDate     DateTime?
+  dischargeDateSource SurgeryDateSource @default(UNKNOWN)
+  /// End of the episode of care (End Date of Database Tracking / Database Discharge Date).
+  databaseDischargeDate DateTime?
   createdAt         DateTime          @default(now())
 
   notes              ClinicalNote[]
@@ -369,6 +375,12 @@ model ComplicationPrediction {
   promptVersion         String?
   exampleLibraryVersion Int?
   escalated             Boolean              @default(false)
+  /// Per-criterion answers (Defined / Code this Event / exclusions) with verified evidence.
+  criteriaResults       Json?
+  /// Deterministic STS timeframe check: window, event date and status.
+  timeframeCheck        Json?
+  /// Self-consistency outcome, e.g. "2/2 runs agree" or "split; tie-break by escalation model".
+  agreement             String?
   cacheKey              String?
   supersededAt          DateTime?
   createdAt             DateTime             @default(now())
@@ -568,6 +580,14 @@ model ClassificationCache {
   result        Json
   createdAt     DateTime  @default(now())
   invalidatedAt DateTime?
+}
+
+/// Stage-A screening result per note chunk (keyed by text hash + catalogue + model + prompt version).
+model NoteScreenCache {
+  id        String   @id @default(cuid())
+  cacheKey  String   @unique
+  result    Json
+  createdAt DateTime @default(now())
 }
 
 model EvaluationRun {

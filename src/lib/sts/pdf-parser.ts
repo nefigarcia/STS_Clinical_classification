@@ -25,7 +25,8 @@ export function checkManualIdentity(pages: string[]): IdentityCheck {
   const all = pages.length > 15 ? head + "\n" + pages.slice(15, 60).join("\n") : head;
   const signals = {
     societyOfThoracicSurgeons: /society of thoracic surgeons|\bSTS\b/i.test(all),
-    congenitalHeartSurgery: /congenital heart surgery/i.test(all),
+    // Cover titles wrap across lines ("CONGENITAL HEART\nSURGERY DATABASE"), so match across whitespace.
+    congenitalHeartSurgery: /congenital\s+heart\s+surgery|\bCHSD\b/i.test(all),
     trainingManualOrSpec: /training manual|data specifications?|data manager/i.test(all),
     fieldStructure: /long name|short name|seq(uence)?\.?\s*#|intent\s*\/\s*clarification/i.test(pages.slice(0, 200).join("\n")),
   };

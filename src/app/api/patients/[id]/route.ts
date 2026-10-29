@@ -34,11 +34,23 @@ const patchSchema = z.object({
     .regex(/^\d{4}-\d{2}-\d{2}$/)
     .nullable()
     .optional(),
+  databaseDischargeDate: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .nullable()
+    .optional(),
+  /** OR exit of the index operation, local wall-clock "YYYY-MM-DDTHH:mm". */
+  orExitAt: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/)
+    .nullable()
+    .optional(),
 });
 
-const d = (s: string | null | undefined) => (s === undefined ? undefined : s === null ? null : new Date(`${s}T00:00:00Z`));
+const d = (s: string | null | undefined) => (s === undefined ? undefined : s === null ? null : new Date(s.length > 10 ? `${s}:00Z` : `${s}T00:00:00Z`));
+const src = (v: string | null | undefined) => (v === undefined ? undefined : v ? ("MANUAL" as const) : ("UNKNOWN" as const));
 
-/** Reviewer-confirmed encounter dates (surgery date drives STS manual version selection). */
+/** Reviewer-confirmed encounter dates. They select the STS manual version and drive the STS timeframe engine. */
 export async function PATCH(req: NextRequest, ctx: RouteContext<"/api/patients/[id]">) {
   return handle("PATCH /api/patients/[id]", async () => {
     const user = await requireRole("REVIEWER");
@@ -48,9 +60,12 @@ export async function PATCH(req: NextRequest, ctx: RouteContext<"/api/patients/[
       where: { id },
       data: {
         surgeryDate: d(body.surgeryDate),
-        surgeryDateSource: body.surgeryDate === undefined ? undefined : body.surgeryDate ? "MANUAL" : "UNKNOWN",
+        surgeryDateSource: src(body.surgeryDate),
         admissionDate: d(body.admissionDate),
         dischargeDate: d(body.dischargeDate),
+        dischargeDateSource: src(body.dischargeDate),
+        databaseDischargeDate: d(body.databaseDischargeDate),
+        orExitAt: d(body.orExitAt),
       },
     });
     await audit({ userId: user.id, action: "encounter.update_dates", entityType: "Encounter", entityId: id, metadata: { fields: Object.keys(body) } });

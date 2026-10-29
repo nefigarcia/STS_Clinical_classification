@@ -81,23 +81,34 @@ export async function approvedFixtureManual() {
       identityCheck: { isStsChsdManual: true },
     },
   });
-  const mkRule = (code: string, name: string, page: number) =>
+  // Definitions use the CHSD layout but made-up wording (TEST FIXTURE, not STS content).
+  const def = (what: string, req: string, excl: string) =>
+    `Defined: fixture ${what}.\nTimeframe: Other postop event timeframe\nSee General Information Postoperative Event\nTimeframe for additional information.\nCode this Event: if the patient has ${what} ${req} during the defined\ntimeframe.\nDo not include ${excl}.`;
+  const mkRule = (code: string, name: string, page: number, definition: string) =>
     prisma.sTSManualRule.create({
       data: {
         manualVersionId: mv.id,
         manualVersion: mv.version,
-        sectionName: "TEST POSTOPERATIVE EVENTS",
+        sectionName: "S9. TEST POSTOPERATIVE EVENTS",
         pageNumber: page,
+        longName: "Postoperative Events - Multi-Select",
+        seqNumber: "4740",
         stsCode: code,
         complicationName: name,
+        definition,
         isComplicationRule: true,
-        chunkText: `TEST FIXTURE postoperative complication rule. Code ${code}: ${name}. Pneumothorax chylothorax arrhythmia reintubation chest tube pacing.`,
+        chunkText: `TEST FIXTURE Code ${code}: ${name}\n${definition}`,
       },
     });
   const rules = {
-    ptx: await mkRule("T100", "Fixture pneumothorax", 10),
-    chylo: await mkRule("T200", "Fixture chylothorax", 11),
-    arr: await mkRule("T300", "Fixture arrhythmia", 12),
+    ptx: await mkRule("T100", "Fixture pneumothorax", 10, def("pneumothorax", "requiring chest tube", "pneumothorax followed with radiographs only")),
+    chylo: await mkRule("T200", "Fixture chylothorax", 11, def("chylothorax", "with treatment", "chylous effusion without treatment")),
+    arr: await mkRule(
+      "T300",
+      "Fixture arrhythmia temporary pacing",
+      12,
+      def("arrhythmia", "requiring active temporary pacing", "wires in place without active pacing"),
+    ),
   };
   return { manual: mv, rules };
 }

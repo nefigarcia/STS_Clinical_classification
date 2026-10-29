@@ -9,10 +9,15 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 
 export const dynamic = "force-dynamic";
 
-/** Auth.js errors carry a stable `type`; class names are minified in production builds. */
+/**
+ * Auth.js errors carry a stable `type`; class names are minified in production builds.
+ * A Prisma code from the wrapped cause (e.g. P1001 = DB unreachable) is appended; it is generic, never data.
+ */
 function authErrorType(err: unknown): string {
-  const type = (err as { type?: unknown } | null)?.type;
-  return typeof type === "string" ? type : "SignInError";
+  const e = err as { type?: unknown; cause?: { err?: { code?: unknown; errorCode?: unknown } } } | null;
+  const type = typeof e?.type === "string" ? e.type : "SignInError";
+  const code = e?.cause?.err?.code ?? e?.cause?.err?.errorCode;
+  return typeof code === "string" && /^P\d{4}$/.test(code) ? `${type}: ${code}` : type;
 }
 
 function safeCallback(v: string | string[] | undefined) {

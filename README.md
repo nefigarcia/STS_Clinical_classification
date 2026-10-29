@@ -137,48 +137,81 @@ The CLI makes **no network calls**. It classifies data as `PHI` by default, so t
 
 ## Loading the STS manual
 
-The STS CHSD Training Manual (`2026-07_CHSD TM Version 6.23.2.pdf`) **has not been supplied**. Until an approved manual is loaded, STS-based classification is disabled everywhere: a UI banner shows it, the classification gate enforces it, and classification job creation returns 409.
+The manual is **static reference data**. It is loaded once per version per environment, stored in Postgres and shared by every user. Nobody uploads it at sign-in. Until an approved manual exists, STS-based classification is disabled: a UI banner shows it, the classification gate enforces it, and job creation returns 409.
 
-To load it (Administrator, **STS Knowledge Base** page):
+**Load it once (recommended):**
 
-1. Upload the PDF, enter its version label, and optionally an effective surgery-date window.
-2. A background job extracts text per page and runs an **identity check**. The document must identify itself as an STS *Congenital Heart Surgery* Database training manual or data specification. Other documents, such as the Qlik/Talend order form included with this request, are rejected and never indexed.
-3. The manual is chunked by **field blocks** (Long Name / Short Name / Seq # / Table / Definition / Intent-Clarification / codes) and by section headings, so a definition always stays with its clarification. Page numbers and sections are kept, and coded values become code-level rules used for code validation.
-4. If `OPENAI_API_KEY` is set, rule chunks are embedded once per manual version. Only manual text is embedded, never patient data. Otherwise retrieval uses keyword search only.
-5. An administrator reviews the parse statistics, spot-checks rules in the rule browser, and clicks **Approve**, confirming identity. Approving or retiring a manual invalidates cached classifications.
+```bash
+# keep the PDF in ./reference-data/ (git-ignored); never commit it or bake it into a deploy
+npm run load:manual -- "reference-data/2026-07_CHSD TM Version 6.23.2.pdf"            # parse, check identity, embed, print stats
+npm run load:manual -- "reference-data/2026-07_CHSD TM Version 6.23.2.pdf" --approve  # approve after reviewing the stats
+# optional: --version 6.23.2 --effective-from 2026-07-01 --effective-to 2027-07-01
+```
 
-Multiple manual versions are supported. The version is chosen per encounter from the surgery date and each manual's effective window, falling back to the default version. How the manual was selected is recorded with each run.
+The command is idempotent: if the same file (same SHA-256) is already loaded, it does nothing. For Vercel, run it once against the production `DATABASE_URL` from a trusted machine or CI, like `npm run db:migrate`. When STS publishes a new version, load it the same way. Administrators can also upload it in **STS Knowledge Base**, which runs the same pipeline as a background job.
 
-> The parser's field layout is based on the STS data-specification format and has **not** been verified against v6.23.2 itself. Review the parse statistics and rule browser before approving.
+**What happens:**
+
+1. **Identity check.** The document must identify itself as the STS Congenital Heart Surgery Database Training Manual. Other documents, such as the Qlik/Talend order form shared with the original request, are rejected and never indexed.
+2. **Field blocks.** Each data field becomes one rule containing all of its labels, so a definition always stays with its clarification. The labels are Long Name, SeqNo, Short Name, Database Table Name, Definition, Parent conditions, Harvest Codes and Intent/Clarification. Page headers are stripped, and page numbers and section names (for example `S2. POSTOPERATIVE EVENTS`) are kept.
+3. **Code-level rules.** Each code of a complication or event field becomes its own rule carrying that code's definition from the manual's "Code: Value: Definition:" table (Defined / Timeframe / Code this Event / exclusions). Example: `190 Pneumothorax, Requiring drainage or evacuation`, p. 1101.
+4. **Embeddings.** If `OPENAI_API_KEY` is set, rule text is embedded once per version. Only manual text is sent, never patient data. Otherwise retrieval uses keyword search only.
+5. **Approval.** An administrator spot-checks rules in the rule browser and approves, either with `--approve` or the **Approve** button. Approving or retiring a manual invalidates cached classifications.
+
+**Verified on v6.23.2** (1,307 pages):
+- **Rules:** 1,419 extracted, from 1,002 distinct fields.
+- **Postoperative Events (SeqNo 4740):** all 43 codes extracted, each with its own definition.
+- **Retrieval:** for all 9 historical label types, keyword search returns the correct code in its top 3.
+
+Multiple manual versions are supported. Each encounter's version is chosen from its surgery date and each manual's effective window, falling back to the default version. The selection used is recorded with every run.
 
 ---
 
 ## AI processing
 
-For each encounter (`src/lib/ai/classifier.ts`):
+Classification is built to be audit-grade: high recall, a criterion-by-criterion decision against the STS definition, and a final decision computed in code (`src/lib/ai/classifier.ts`). For each encounter:
 
-1. **Note preparation:** chronological order, exact-duplicate removal, overlapping semantic passages.
-2. **Candidate discovery:** passages are ranked using a clinical vocabulary and negation/assertion screening. Keywords are search guidance only, never proof. Encounters with no candidate passages are not sent to the model.
-3. **Rule retrieval:** hybrid search (Postgres full-text + pgvector cosine, combined by reciprocal-rank fusion) restricted to the selected manual version.
-4. **Example retrieval:** only clinician-**VERIFIED** examples from the active library. Examples from the same patient and from held-out or test cohorts are excluded.
-5. **Model call:** Responses API structured output with `store: false`. The prompt contains **no MRN, CSN or NOTE_ID**. The model refers to passages and rules only by labels (`P3`, `R2`).
-6. **Independent validation** (`response-validator.ts`):
-   - Every evidence excerpt must appear verbatim in the cited passage, and its offsets are mapped back to the note.
-   - Rule references must be among the retrieved rules.
-   - STS codes must exist in the indexed manual. Invented codes are removed.
-   - Unsupported "confirmed" events are downgraded to insufficient evidence.
-   - Negated, historical, planned and out-of-window events are stored as EXCLUDED and shown collapsed.
-   - Duplicate events across notes are merged.
+1. **STS event catalogue.** The code-level rules of the configured event field (CHSD Postoperative Events, SeqNo 4740: 40 detectable codes) are turned into checklists (`src/lib/sts/criteria.ts`). Each checklist has:
+   - **D1:** the Defined criterion.
+   - **C1:** the Code this Event criterion, including its inclusion lists.
+   - **E1…En:** each exclusion ("Do not include…", "Does not include…", "not considered…").
+   - The code's timeframe class: Intraoperative, Major or Other.
+2. **Stage A: full-coverage screening** (`screening.ts`).
+   - Every unique note from 2 days before the index operation onward is screened against the whole catalogue, in overlapping chunks. Keywords never decide what the model sees.
+   - The model lists every possible event mention with a verbatim quote; unknown codes and non-verbatim quotes are discarded.
+   - Results are cached per text chunk, so unchanged notes are never screened again.
+   - The cheaper "keyword passages only" mode is available in Settings.
+3. **Stage B: per-code checklist adjudication** (`adjudication.ts`). Each flagged code is judged against its full STS definition. The model answers **every** criterion as met, not met or unclear, citing verbatim quotes. It sees the passages, the encounter timeline and verified examples. The prompt contains **no MRN, CSN or NOTE_ID**.
+4. **Deterministic decision in code.**
+   - Positive only if D1 and C1 are met with **verified** quotes, no exclusion applies, and the event date falls inside the STS window.
+   - A "met" answer without a verbatim quote is downgraded to unclear.
+   - Unclear answers go to human review (SUSPECTED).
+   - Negative decisions are stored as EXCLUDED with their reasons, so reviewers can see what was considered and why it was not coded.
+5. **Deterministic STS timeframe** (`timeframe.ts`):
+   - Intraoperative: the operation day / OR exit.
+   - Other: after OR exit, through the later of postoperative day 30 or hospital discharge.
+   - Major: additionally through database discharge (end of the episode of care).
+   - Events before the index operation are excluded. Missing dates make the check "unverifiable", which goes to review rather than a guess.
+   - The event date is extracted from the notes when documented, otherwise taken from the earliest evidence note date (marked approximate).
+6. **Self-consistency.**
+   - Each flagged code is adjudicated `consistencyRuns` times (default 2; high-risk codes always at least 2).
+   - If the runs disagree, the escalation model breaks the tie and the result **always** goes to human review.
+   - The agreement record ("2/2 runs agree", "split …") is stored and shown.
+7. **Persistence:**
+   - Saved with every prediction: criterion answers with evidence, the timeframe check, agreement, and the model, prompt, manual and example-library versions.
+   - Earlier unreviewed AI predictions are superseded but kept.
+   - Reviewed predictions are never modified.
    - **Nothing is ever auto-approved.**
-7. **Escalation** to the escalation model on validation failure, conflicting evidence, a complex multi-event timeline, a high-risk label, a model flag or a reviewer's "Second opinion" request, subject to the escalation-rate cap.
-8. **Persistence** with model, prompt, manual and example-library versions. Earlier unreviewed AI predictions are superseded and kept. Reviewed predictions are never modified.
+
+**Encounter dates drive the timeframe.** The review screen has fields for the index operation date, OR exit, hospital discharge and database discharge. Missing values are marked "derived" or "unknown": hospital discharge falls back to the latest Discharge Summary date. Ideally these come from the EHR; changing them changes the cache key.
 
 **Cost controls (Settings):**
 
 - Limits: job token budget, per-encounter cost, escalation-rate cap, retry limit and daily cost limit. A job that hits a limit pauses and can be resumed.
 - Per-model prices are **entered by an administrator**, because none are assumed. Without them, cost shows as "price not configured".
 - Every call records input, cached and output tokens, reasoning tokens, duration, retries, outcome and cost.
-- Identical inputs and configuration reuse the **SHA-256 cache**. The cache key covers note hashes, models, reasoning effort, prompt version, manual version, retrieval settings, library version and output schema.
+- Identical inputs and configuration reuse the **SHA-256 cache**. The cache key covers note hashes, models, reasoning effort, prompt version, manual version, pipeline and retrieval settings, encounter dates, library version and output schema. Stage A screening is additionally cached per note chunk.
+- Full screening costs scale with note volume (every note in the window is read once per model/prompt/catalogue version). Budget the job token limit accordingly; the screening cache makes re-runs cheap.
 
 **Model IDs.** `gpt-6-luna` and `gpt-6.1-sol` are configuration defaults from the specification. They have **not** been verified to exist or to support `reasoning.effort` or structured outputs. Use **Settings → Verify models** (`models.retrieve`). If a model is unavailable, calls fail visibly. The app never silently substitutes a different model.
 
@@ -330,7 +363,7 @@ tests/unit, tests/integration, tests/e2e
 
 ## Known limitations and unverified assumptions
 
-- **No STS manual is loaded**, so end-to-end classification against real STS rules has not been run. The rule parser is untested on v6.23.2.
+- End-to-end classification against the real manual has not been run on real notes. It needs PHI approval, or synthetic notes, plus verified model IDs. The parser is verified on v6.23.2's structure, but other STS versions may change the layout, so always review parse statistics before approving.
 - **The OpenAI model IDs, reasoning-effort support and structured-output support are unverified.** Classification was tested only with a mocked client.
 - The clinical vocabulary and negation heuristics only prioritize passages. They are not validated clinical NLP.
 - Surgery dates are derived heuristically and must be confirmed by a reviewer, because they select the manual version.

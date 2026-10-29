@@ -1,37 +1,76 @@
-import { zodTextFormat } from "openai/helpers/zod";
-import type { Prisma } from "@prisma/client";
+import type { ClassificationStatus, ClinicalNote, Prisma, ReviewStatus, STSManualRule } from "@prisma/client";
 import { prisma } from "@/lib/db/prisma";
-import { sha256 } from "@/lib/data/normalization";
+import { sha256, dateKey } from "@/lib/data/normalization";
 import { getSetting } from "@/lib/settings";
 import { classificationGate, encounterClassification } from "@/lib/security/gates";
-import { allowedCodes } from "@/lib/sts/code-validator";
-import { openai, modelConfig, withRetries, errorCode } from "./openai-client";
-import { recordAiCall, spendToday, estimateTokens, computeCost } from "./cost-tracker";
-import { embedTexts } from "./embeddings";
+import { buildChecklist, isScreenableCode, type CodeChecklist } from "@/lib/sts/criteria";
+import { modelConfig } from "./openai-client";
+import { spendToday } from "./cost-tracker";
 import { prepareEncounterPassages } from "./candidate-detection";
-import { searchRules, selectManualVersion, type RetrievedRule } from "./sts-rules";
+import { selectManualVersion } from "./sts-rules";
 import { retrieveExamples } from "./evidence-retrieval";
-import { activePrompt, buildUserPrompt } from "./prompts";
-import { modelOutputSchema, type ModelOutput } from "./response-schema";
-import { validateModelOutput, type ValidatedEvent, type ValidationSummary } from "./response-validator";
-import { decideEscalation } from "./model-router";
+import { activePrompt } from "./prompts";
+import { callStructured } from "./model-call";
+import { noteSegments, screenSegment, type CatalogueEntry, type ScreenMention } from "./screening";
+import {
+  adjudicationSchema,
+  buildAdjudicationPrompt,
+  decide,
+  describeWindow,
+  validateAdjudication,
+  type CodeDecision,
+  type CriterionResult,
+  type Outcome,
+  type Passage,
+} from "./adjudication";
+import { checkEventDate, computeWindow, type EncounterDates, type TimeframeStatus } from "./timeframe";
 
-export const OUTPUT_SCHEMA_VERSION = "1";
+/**
+ * Audit-grade classification of one encounter:
+ *  A. Screening   — every note in the STS window is screened against the full event catalogue (recall).
+ *  B. Adjudication — each flagged code is judged criterion-by-criterion against its STS checklist,
+ *                    `consistencyRuns` times; disagreement → escalation model tie-break + human review.
+ *  C. Decision    — computed in code from verified answers + deterministic STS timeframe check.
+ * Nothing is auto-approved.
+ */
+
+export const OUTPUT_SCHEMA_VERSION = "2";
 
 export class BudgetExceededError extends Error {}
 export class GateClosedError extends Error {}
 
 export type ClassifyOptions = {
   jobId?: string | null;
+  /** Reviewer-requested second evaluation: adjudicate with the escalation model. */
   forceEscalation?: boolean;
-  /** Evaluation mode: use this model only, do not persist predictions, do not read cache. */
+  /** Evaluation mode: this model for all stages; nothing persisted; screening cache still used. */
   evaluationModel?: string;
   escalationStats?: { escalated: number; processed: number };
 };
 
+export type EncounterEvent = {
+  code: string;
+  complication: string;
+  stsCode: string;
+  classificationStatus: ClassificationStatus;
+  reviewStatus: ReviewStatus;
+  outcome: Outcome;
+  reasons: string[];
+  criteria: CriterionResult[];
+  evidence: { clinicalNoteId: string; noteId: string; excerpt: string; start: number; end: number; verified: boolean }[];
+  eventDate: Date | null;
+  eventDateSource: string;
+  timeframe: { status: TimeframeStatus; window: string; classes: string | null };
+  agreement: string;
+  explanation: string;
+  issues: string[];
+  modelUsed: string;
+  rule: Pick<STSManualRule, "id" | "pageNumber" | "sectionName">;
+};
+
 export type ClassifyResult = {
   encounterId: string;
-  events: ValidatedEvent[];
+  events: EncounterEvent[];
   persistedPredictionIds: string[];
   cacheHit: boolean;
   escalated: boolean;
@@ -39,323 +78,369 @@ export type ClassifyResult = {
   modelUsed: string;
   costUsd: number | null;
   passagesSent: number;
+  notesScreened: number;
   manualVersion: string;
   manualSelection: string;
 };
 
-type CachedPayload = {
-  events: SerializedEvent[];
-  modelUsed: string;
-  escalated: boolean;
-  escalationReasons: string[];
-  manualSelection: string;
-  passagesSent: number;
-};
-type SerializedEvent = Omit<ValidatedEvent, "eventDate"> & { eventDate: string | null };
+type Cost = { total: number | null };
+const addCost = (c: Cost, v: number | null) => (c.total = c.total === null || v === null ? null : c.total + v);
+const DAY = 86_400_000;
 
-const serialize = (e: ValidatedEvent): SerializedEvent => ({ ...e, eventDate: e.eventDate ? e.eventDate.toISOString() : null });
-const deserialize = (e: SerializedEvent): ValidatedEvent => ({ ...e, eventDate: e.eventDate ? new Date(e.eventDate) : null });
-
-async function callModel(
-  model: string,
-  effort: string,
-  system: string,
-  user: string,
-  ctx: { jobId?: string | null; encounterId: string; purpose: string; retryLimit: number },
-) {
-  const started = Date.now();
-  try {
-    const { value: res, retries } = await withRetries(
-      () =>
-        openai().responses.parse({
-          model,
-          reasoning: { effort: effort as "low" },
-          store: false, // do not retain clinical content in the Responses store
-          input: [
-            { role: "system", content: system },
-            { role: "user", content: user },
-          ],
-          text: { format: zodTextFormat(modelOutputSchema, "clinical_classification") },
-        }),
-      ctx.retryLimit,
-    );
-    const usage = {
-      inputTokens: res.usage?.input_tokens ?? 0,
-      cachedInputTokens: res.usage?.input_tokens_details?.cached_tokens ?? 0,
-      outputTokens: res.usage?.output_tokens ?? 0,
-      reasoningTokens: res.usage?.output_tokens_details?.reasoning_tokens ?? 0,
-    };
-    const cost = await recordAiCall({
-      jobId: ctx.jobId,
-      encounterId: ctx.encounterId,
-      purpose: ctx.purpose,
-      model,
-      reasoningEffort: effort,
-      usage,
-      durationMs: Date.now() - started,
-      retries,
-      success: true,
-    });
-    const parsed = res.output_parsed;
-    if (!parsed) throw new Error("Model returned no parseable structured output");
-    return { output: parsed as ModelOutput, cost, usage };
-  } catch (err) {
-    await recordAiCall({
-      jobId: ctx.jobId,
-      encounterId: ctx.encounterId,
-      purpose: ctx.purpose,
-      model,
-      reasoningEffort: effort,
-      usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0 },
-      durationMs: Date.now() - started,
-      retries: (err as { retries?: number }).retries ?? 0,
-      success: false,
-      errorCode: errorCode(err),
-    });
-    throw err;
+/** Encounter dates for the timeframe engine; hospital discharge falls back to the latest Discharge Summary note. */
+export function encounterDates(
+  enc: { surgeryDate: Date | null; orExitAt: Date | null; dischargeDate: Date | null; databaseDischargeDate: Date | null },
+  notes: Pick<ClinicalNote, "noteType" | "dateOfService">[],
+): { dates: EncounterDates; dischargeDerived: boolean } {
+  let discharge = enc.dischargeDate;
+  let derived = false;
+  if (!discharge) {
+    const ds = notes
+      .filter((n) => /discharge summary/i.test(n.noteType ?? "") && n.dateOfService)
+      .sort((a, b) => b.dateOfService!.getTime() - a.dateOfService!.getTime())[0];
+    if (ds) {
+      discharge = ds.dateOfService;
+      derived = true;
+    }
   }
+  return {
+    dates: { surgeryDate: enc.surgeryDate, orExitAt: enc.orExitAt, hospitalDischargeDate: discharge, databaseDischargeDate: enc.databaseDischargeDate },
+    dischargeDerived: derived,
+  };
 }
 
-/**
- * Classify one encounter: prepare notes -> candidate passages -> STS rule retrieval ->
- * verified example retrieval -> structured model call -> independent validation ->
- * optional escalation -> persistence (never auto-approved).
- */
+function passageAround(note: ClinicalNote, start: number, end: number, radius = 900) {
+  const t = note.combinedNoteText;
+  let s = Math.max(0, start - radius);
+  let e = Math.min(t.length, end + radius);
+  const ws = t.lastIndexOf("\n", s + 200);
+  if (ws > s - 200 && ws >= 0) s = ws + 1;
+  const we = t.indexOf("\n", e - 200);
+  if (we > 0 && we < e + 200) e = we;
+  return { start: s, end: e };
+}
+
+/** Merge overlapping windows per note, order chronologically and cap the count (affirmed/possible first). */
+function buildPassages(mentions: ScreenMention[], notes: Map<string, ClinicalNote>, max: number): Passage[] {
+  const rank = (a: ScreenMention["assertion"]) => (a === "affirmed" ? 0 : a === "possible" ? 1 : 2);
+  const sorted = [...mentions].sort((a, b) => rank(a.assertion) - rank(b.assertion));
+  const windows = new Map<string, { start: number; end: number }[]>();
+  let count = 0;
+  for (const m of sorted) {
+    const note = notes.get(m.clinicalNoteId);
+    if (!note) continue;
+    const w = passageAround(note, m.start, m.end);
+    const list = windows.get(note.id) ?? [];
+    const overlap = list.find((x) => w.start <= x.end && w.end >= x.start);
+    if (overlap) {
+      overlap.start = Math.min(overlap.start, w.start);
+      overlap.end = Math.max(overlap.end, w.end);
+    } else {
+      if (count >= max) continue;
+      list.push(w);
+      count++;
+    }
+    windows.set(note.id, list);
+  }
+  const passages: Omit<Passage, "label">[] = [];
+  for (const [noteId, list] of windows) {
+    const n = notes.get(noteId)!;
+    for (const w of list)
+      passages.push({
+        clinicalNoteId: n.id,
+        noteId: n.noteId,
+        noteType: n.noteType,
+        date: n.dateOfService,
+        start: w.start,
+        end: w.end,
+        text: n.combinedNoteText.slice(w.start, w.end),
+      });
+  }
+  return passages
+    .sort((a, b) => (a.date?.getTime() ?? 0) - (b.date?.getTime() ?? 0) || a.noteId.localeCompare(b.noteId) || a.start - b.start)
+    .map((p, i) => ({ ...p, label: `P${i + 1}` }));
+}
+
+function timelineText(d: EncounterDates, dischargeDerived: boolean): string {
+  const f = (x: Date | null) => (x ? x.toISOString().slice(0, 10) : "unknown");
+  return [
+    `Index operation date: ${f(d.surgeryDate)}`,
+    `OR exit: ${d.orExitAt ? d.orExitAt.toISOString().slice(0, 16).replace("T", " ") : "unknown"}`,
+    `Hospital discharge: ${f(d.hospitalDischargeDate)}${dischargeDerived ? " (derived from discharge summary date)" : ""}`,
+    `Database discharge / end of episode: ${f(d.databaseDischargeDate)}`,
+  ].join("\n");
+}
+
+/** Event date: the model's date if consistent with the evidence, else the earliest verified evidence note date. */
+function resolveEventDate(
+  modelDate: string | null,
+  evidence: { clinicalNoteId: string }[],
+  notes: Map<string, ClinicalNote>,
+): { date: Date | null; source: string } {
+  const evDates = evidence.map((e) => notes.get(e.clinicalNoteId)?.dateOfService).filter((d): d is Date => Boolean(d));
+  const latest = evDates.length ? Math.max(...evDates.map((d) => d.getTime())) : null;
+  const m = modelDate?.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) {
+    const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+    // A documented event cannot occur after the note that documents it (allow same day).
+    if (!Number.isNaN(d.getTime()) && (latest === null || d.getTime() <= latest + DAY)) return { date: d, source: "documented in notes (model-extracted)" };
+  }
+  if (evDates.length) return { date: new Date(Math.min(...evDates.map((d) => d.getTime()))), source: "earliest evidence note date (approximate)" };
+  return { date: null, source: "unknown" };
+}
+
+type RunResult = {
+  decision: CodeDecision;
+  results: CriterionResult[];
+  issues: string[];
+  eventDate: Date | null;
+  eventDateSource: string;
+  timeframe: TimeframeStatus;
+  explanation: string;
+  model: string;
+};
+
 export async function classifyEncounter(encounterId: string, opts: ClassifyOptions = {}): Promise<ClassifyResult> {
   const encounter = await prisma.encounter.findUniqueOrThrow({ where: { id: encounterId }, include: { patient: true, notes: true } });
-  const dataClass = await encounterClassification(encounterId);
-  const gate = await classificationGate(dataClass);
+  const gate = await classificationGate(await encounterClassification(encounterId));
   if (!gate.allowed) throw new GateClosedError(gate.reasons.join(" "));
-
   const selection = await selectManualVersion(encounter.surgeryDate, encounter.surgeryDateSource);
   if (!selection) throw new GateClosedError("No approved STS manual");
   const manual = selection.manual;
 
-  const [limits, retrieval, pricing, highRiskTerms, prompt] = await Promise.all([
+  const [limits, retrieval, pipeline, highRiskTerms, prompt] = await Promise.all([
     getSetting("processingLimits"),
     getSetting("retrieval"),
-    getSetting("modelPricing"),
+    getSetting("pipeline"),
     getSetting("highRiskTerms"),
     activePrompt(),
   ]);
   const cfg = modelConfig();
-  const primaryModel = opts.evaluationModel ?? cfg.primary;
+  const primary = opts.evaluationModel ?? cfg.primary;
+  const adjudicator = opts.forceEscalation && !opts.evaluationModel ? cfg.escalation : primary;
+  const adjEffort = opts.forceEscalation && !opts.evaluationModel ? cfg.escalationEffort : cfg.primaryEffort;
 
-  const prep = prepareEncounterPassages(encounter.notes, retrieval);
+  // STS event catalogue (code-level rules of the configured event field(s)).
+  const codeRules = await prisma.sTSManualRule.findMany({
+    where: { manualVersionId: manual.id, seqNumber: { in: pipeline.eventFieldSeqNos }, stsCode: { not: null } },
+    orderBy: { pageNumber: "asc" },
+  });
+  const checklists = new Map<string, { rule: STSManualRule; checklist: CodeChecklist }>();
+  for (const r of codeRules) {
+    if (!r.complicationName || !isScreenableCode(r.stsCode!, r.complicationName) || checklists.has(r.stsCode!)) continue;
+    checklists.set(r.stsCode!, { rule: r, checklist: buildChecklist(r.stsCode!, r.complicationName, r.definition ?? "") });
+  }
+  if (checklists.size === 0) throw new GateClosedError(`The approved manual has no coded events for field(s) ${pipeline.eventFieldSeqNos.join(", ")}`);
+  const catalogue: CatalogueEntry[] = [...checklists.values()].map(({ checklist }) => ({
+    code: checklist.code,
+    name: checklist.name,
+    defined: (checklist.criteria.find((c) => c.kind === "defined")?.text ?? "").slice(0, 240),
+  }));
+
+  const { dates, dischargeDerived } = encounterDates(encounter, encounter.notes);
+  const uniqueNotes = [...new Map(encounter.notes.map((n) => [n.contentHash, n])).values()];
+  const noteById = new Map(encounter.notes.map((n) => [n.id, n]));
+
+  // Notes in scope: from 2 days before the index operation (context for pre-existing conditions) onward.
+  const scopeStart = dates.surgeryDate
+    ? Date.UTC(dates.surgeryDate.getUTCFullYear(), dates.surgeryDate.getUTCMonth(), dates.surgeryDate.getUTCDate()) - 2 * DAY
+    : null;
+  const inScope = uniqueNotes.filter((n) => !n.dateOfService || scopeStart === null || n.dateOfService.getTime() >= scopeStart);
+
   const lib = await prisma.exampleLibraryVersion.findFirst({ where: { active: true }, select: { version: true } });
   const cacheKey = sha256(
     JSON.stringify({
-      notes: prep.uniqueNotes.map((n) => n.contentHash).sort(),
-      model: primaryModel,
-      escalationModel: cfg.escalation,
-      effort: [cfg.primaryEffort, cfg.escalationEffort],
+      notes: inScope.map((n) => n.contentHash).sort(),
+      models: [primary, adjudicator, cfg.escalation, cfg.primaryEffort, adjEffort, cfg.escalationEffort],
       prompt: prompt.version,
       manual: manual.id,
+      pipeline,
       retrieval,
+      dates: [dates.surgeryDate, dates.orExitAt, dates.hospitalDischargeDate, dates.databaseDischargeDate].map((d) => (d ? dateKey(d) : null)),
       library: lib?.version ?? null,
       schema: OUTPUT_SCHEMA_VERSION,
+      force: Boolean(opts.forceEscalation),
     }),
   );
-
   const base = { encounterId, manualVersion: manual.version, manualSelection: selection.selection };
 
-  // Cache: identical inputs + configuration -> reuse the validated result.
-  if (!opts.evaluationModel && !opts.forceEscalation) {
+  if (!opts.evaluationModel) {
     const cached = await prisma.classificationCache.findUnique({ where: { cacheKey } });
     if (cached && !cached.invalidatedAt) {
-      const payload = cached.result as unknown as CachedPayload;
-      const events = payload.events.map(deserialize);
-      const existing = await prisma.complicationPrediction.findMany({ where: { encounterId, cacheKey, supersededAt: null }, select: { id: true } });
-      const ids = existing.length
-        ? existing.map((p) => p.id)
-        : await persist(encounterId, events, {
-            ...ctxFor(payload.modelUsed, prompt.version, manual.id, manual.version, lib?.version ?? null, cacheKey, payload.escalated, opts.jobId),
-          });
+      const ids = (await prisma.complicationPrediction.findMany({ where: { encounterId, cacheKey, supersededAt: null }, select: { id: true } })).map(
+        (p) => p.id,
+      );
+      const payload = cached.result as unknown as { modelUsed: string; escalated: boolean; notesScreened: number; passagesSent: number };
       return {
         ...base,
-        events,
+        events: [],
         persistedPredictionIds: ids,
         cacheHit: true,
         escalated: payload.escalated,
-        escalationReasons: payload.escalationReasons,
+        escalationReasons: [],
         modelUsed: payload.modelUsed,
         costUsd: 0,
         passagesSent: payload.passagesSent,
+        notesScreened: payload.notesScreened,
       };
     }
   }
 
-  if (prep.passages.length === 0) {
-    // Nothing clinically relevant found by candidate discovery: record an empty result, no API call.
-    const payload: CachedPayload = {
-      events: [],
-      modelUsed: "none (no candidate passages)",
-      escalated: false,
-      escalationReasons: [],
-      manualSelection: selection.selection,
-      passagesSent: 0,
-    };
-    if (!opts.evaluationModel) {
-      await prisma.classificationCache.upsert({
-        where: { cacheKey },
-        create: {
-          cacheKey,
-          encounterId,
-          model: payload.modelUsed,
-          promptVersion: prompt.version,
-          manualVersion: manual.version,
-          result: payload as unknown as Prisma.InputJsonValue,
-        },
-        update: {},
-      });
+  const cost: Cost = { total: 0 };
+  const guard = async () => {
+    if ((await spendToday()) >= limits.dailyCostLimitUsd) throw new BudgetExceededError(`Daily API cost limit $${limits.dailyCostLimitUsd} reached`);
+    if (opts.jobId) {
+      const job = await prisma.processingJob.findUnique({ where: { id: opts.jobId }, select: { tokenUsage: true } });
+      if (job && job.tokenUsage >= limits.maxJobTokenBudget) throw new BudgetExceededError(`Job token budget ${limits.maxJobTokenBudget} reached`);
     }
-    return {
-      ...base,
-      events: [],
-      persistedPredictionIds: [],
-      cacheHit: false,
-      escalated: false,
-      escalationReasons: [],
-      modelUsed: payload.modelUsed,
-      costUsd: 0,
-      passagesSent: 0,
-    };
+    if (cost.total !== null && cost.total > limits.maxEncounterCostUsd)
+      throw new BudgetExceededError(`Per-encounter cost limit $${limits.maxEncounterCostUsd} exceeded`);
+  };
+  const ctx = { jobId: opts.jobId, encounterId, retryLimit: limits.retryLimit };
+
+  // ---- Stage A: screening -------------------------------------------------------------
+  const segments =
+    pipeline.screeningMode === "full"
+      ? inScope.flatMap((n) => noteSegments(n, pipeline.screenChunkChars))
+      : prepareEncounterPassages(inScope, retrieval).passages.map((p) => ({
+          clinicalNoteId: p.clinicalNoteId,
+          text: p.text,
+          offset: p.start,
+          noteType: p.noteType,
+          date: p.dateOfService,
+        }));
+  const mentions: ScreenMention[] = [];
+  for (const seg of segments) {
+    await guard();
+    const r = await screenSegment(seg, catalogue, primary, cfg.primaryEffort, { ...ctx, purpose: "screening" });
+    addCost(cost, r.cost);
+    mentions.push(...r.mentions);
   }
+  const flagged = [...new Set(mentions.filter((m) => m.assertion === "affirmed" || m.assertion === "possible").map((m) => m.code))];
 
-  // Budget checks before spending.
-  const today = await spendToday();
-  if (today >= limits.dailyCostLimitUsd) throw new BudgetExceededError(`Daily API cost limit $${limits.dailyCostLimitUsd} reached`);
-  if (opts.jobId) {
-    const job = await prisma.processingJob.findUnique({ where: { id: opts.jobId }, select: { tokenUsage: true } });
-    if (job && job.tokenUsage >= limits.maxJobTokenBudget) throw new BudgetExceededError(`Job token budget ${limits.maxJobTokenBudget} reached`);
-  }
-
-  // Rule retrieval per candidate category (queries contain category names and matched terms only, never note text).
-  const ruleQueries = prep.categories.map((c) => {
-    const terms = [...new Set(prep.passages.flatMap((p) => p.hits.filter((h) => h.category === c).map((h) => h.term.toLowerCase())))].slice(0, 6);
-    return `${c} ${terms.join(" ")}`;
-  });
-  let queryVectors: (number[] | null)[] = ruleQueries.map(() => null);
-  if (manual.embeddingModel) {
-    queryVectors = await embedTexts(ruleQueries, { purpose: "rule-query-embedding", jobId: opts.jobId, retryLimit: limits.retryLimit });
-  }
-  const perQuery = Math.max(2, Math.ceil(retrieval.topRules / Math.max(1, ruleQueries.length)));
-  const ruleMap = new Map<string, RetrievedRule>();
-  for (let i = 0; i < ruleQueries.length; i++) {
-    for (const r of await searchRules(manual.id, ruleQueries[i], queryVectors[i], perQuery, { complicationOnly: true })) ruleMap.set(r.id, r);
-    if (ruleMap.size < 2) for (const r of await searchRules(manual.id, ruleQueries[i], queryVectors[i], perQuery)) ruleMap.set(r.id, r);
-  }
-  const rules = [...ruleMap.values()].slice(0, retrieval.topRules + 4).map((r, i) => ({ ...r, label: `R${i + 1}` }));
-
-  const { examples, libraryVersion } = await retrieveExamples({
-    excludeMrn: encounter.patient.mrn,
-    categories: prep.categories,
-    queryEmbedding: null,
-    k: retrieval.topExamples,
-  });
-  const labeledExamples = examples.map((e, i) => ({ ...e, label: `E${i + 1}` }));
-
-  const userPrompt = buildUserPrompt({
-    manualVersion: manual.version,
-    surgeryDate: encounter.surgeryDate ? encounter.surgeryDate.toISOString().slice(0, 10) : null,
-    passages: prep.passages,
-    rules,
-    examples: labeledExamples,
-  });
-
-  // Per-encounter cost guard (only enforceable when pricing is configured).
-  const price = pricing[primaryModel];
-  if (price) {
-    const est =
-      computeCost(
-        primaryModel,
-        { inputTokens: estimateTokens(prompt.systemPrompt + userPrompt), cachedInputTokens: 0, outputTokens: 2000, reasoningTokens: 0 },
-        pricing,
-      ) ?? 0;
-    if (est > limits.maxEncounterCostUsd)
-      throw new BudgetExceededError(`Estimated encounter cost $${est.toFixed(3)} exceeds limit $${limits.maxEncounterCostUsd}`);
-  }
-
-  const codes = await allowedCodes(manual.id);
-  const vctx = { passages: prep.passages, rules, allowedCodes: codes };
-
-  let modelUsed = primaryModel;
-  let totalCost: number | null = 0;
-  const addCost = (c: number | null) => (totalCost = c === null || totalCost === null ? null : totalCost + c);
-
-  let output: ModelOutput;
-  let validation: ValidationSummary;
+  // ---- Stage B: per-code adjudication with consistency --------------------------------
+  const events: EncounterEvent[] = [];
   let escalated = false;
-  let escalationReasons: string[] = [];
+  const escalationReasons: string[] = [];
+  let passagesSent = 0;
+  const timeline = timelineText(dates, dischargeDerived);
 
-  if (opts.forceEscalation && !opts.evaluationModel) {
-    modelUsed = cfg.escalation;
-    const r = await callModel(cfg.escalation, cfg.escalationEffort, prompt.systemPrompt, userPrompt, {
-      jobId: opts.jobId,
-      encounterId,
-      purpose: "classification-escalation",
-      retryLimit: limits.retryLimit,
+  for (const code of flagged) {
+    const { rule, checklist } = checklists.get(code)!;
+    const passages = buildPassages(
+      mentions.filter((m) => m.code === code),
+      noteById,
+      pipeline.maxPassagesPerCode,
+    );
+    passagesSent += passages.length;
+    const { examples } = await retrieveExamples({
+      excludeMrn: encounter.patient.mrn,
+      categories: [checklist.name],
+      queryEmbedding: null,
+      k: retrieval.topExamples,
     });
-    addCost(r.cost);
-    output = r.output;
-    validation = validateModelOutput(output, vctx);
-    escalated = true;
-    escalationReasons = ["reviewer requested second evaluation"];
-  } else {
-    const r = await callModel(primaryModel, cfg.primaryEffort, prompt.systemPrompt, userPrompt, {
-      jobId: opts.jobId,
-      encounterId,
-      purpose: opts.evaluationModel ? "evaluation" : "classification",
-      retryLimit: limits.retryLimit,
+    const user = buildAdjudicationPrompt({
+      checklist,
+      manualVersion: manual.version,
+      timeline,
+      passages,
+      examples: examples.map((e, i) => ({ label: `E${i + 1}`, complication: e.complication, evidence: e.clinicalEvidence })),
     });
-    addCost(r.cost);
-    output = r.output;
-    validation = validateModelOutput(output, vctx);
-    if (!opts.evaluationModel) {
-      const decision = decideEscalation({
-        output,
-        validation,
-        highRiskTerms,
-        forced: false,
-        escalationsSoFar: opts.escalationStats?.escalated ?? 0,
-        processedSoFar: opts.escalationStats?.processed ?? 0,
-        maxEscalationRate: limits.maxEscalationRate,
-        primaryModel,
-        escalationModel: cfg.escalation,
-      });
-      escalationReasons = decision.reasons;
-      if (decision.escalate) {
-        const r2 = await callModel(cfg.escalation, cfg.escalationEffort, prompt.systemPrompt, userPrompt, {
-          jobId: opts.jobId,
-          encounterId,
-          purpose: "classification-escalation",
-          retryLimit: limits.retryLimit,
-        });
-        addCost(r2.cost);
-        const v2 = validateModelOutput(r2.output, vctx);
+    const window = computeWindow(checklist.timeframe, dates);
+
+    const runOnce = async (model: string, effort: string, purpose: string): Promise<RunResult> => {
+      await guard();
+      const { output, cost: c } = await callStructured(model, effort, prompt.systemPrompt, user, adjudicationSchema, "code_adjudication", { ...ctx, purpose });
+      addCost(cost, c);
+      const { results, issues } = validateAdjudication(output, checklist, passages);
+      const metEvidence = results.filter((r) => r.kind !== "exclusion" && r.effectiveStatus === "met").flatMap((r) => r.evidence);
+      const ed = resolveEventDate(output.eventDate, metEvidence, noteById);
+      const tf = checkEventDate(ed.date, window);
+      return {
+        decision: decide(results, tf),
+        results,
+        issues,
+        eventDate: ed.date,
+        eventDateSource: ed.source,
+        timeframe: tf,
+        explanation: output.explanation.slice(0, 2000),
+        model,
+      };
+    };
+
+    const runs: RunResult[] = [];
+    // High-risk codes (arrest, reoperation, ECMO…) always get at least two independent runs.
+    const highRisk = highRiskTerms.some((t) => checklist.name.toLowerCase().includes(t.toLowerCase()));
+    const n = opts.forceEscalation && !opts.evaluationModel ? 1 : Math.max(pipeline.consistencyRuns, highRisk ? 2 : 1);
+    for (let i = 0; i < n; i++)
+      runs.push(await runOnce(adjudicator, adjEffort, opts.evaluationModel ? "evaluation" : i === 0 ? "adjudication" : "adjudication-consistency"));
+
+    let final = runs[0];
+    let agreement = n === 1 ? (opts.forceEscalation ? "single run (reviewer-requested escalation model)" : "single run") : `${n}/${n} runs agree`;
+    const outcomes = new Set(runs.map((r) => r.decision.outcome));
+    if (outcomes.size > 1) {
+      const split = runs.map((r) => r.decision.outcome).join(" vs ");
+      const stats = opts.escalationStats ?? { escalated: 0, processed: 0 };
+      const rateOk = stats.processed === 0 || (stats.escalated + 1) / (stats.processed + 1) <= limits.maxEscalationRate;
+      if (!opts.evaluationModel && cfg.escalation && cfg.escalation !== adjudicator && rateOk) {
+        final = await runOnce(cfg.escalation, cfg.escalationEffort, "adjudication-tiebreak");
         escalated = true;
-        // Keep the escalated result unless it is worse at validation.
-        if (!v2.failed || validation.failed) {
-          output = r2.output;
-          validation = v2;
-          modelUsed = cfg.escalation;
-        }
+        escalationReasons.push(`code ${code}: runs disagreed (${split})`);
+        agreement = `split (${split}); tie-break by ${cfg.escalation}: ${final.decision.outcome}`;
+      } else {
+        agreement = `split (${split}); no tie-break${rateOk ? "" : " (escalation-rate cap reached)"}`;
+        final = {
+          ...runs[0],
+          decision: { outcome: "uncertain", classificationStatus: "SUSPECTED", reviewStatus: "NEEDS_REVIEW", reasons: ["Adjudication runs disagreed"] },
+        };
       }
+      // Any disagreement always goes to a human.
+      final = {
+        ...final,
+        decision: {
+          ...final.decision,
+          reviewStatus: final.decision.classificationStatus === "EXCLUDED" ? "PENDING" : "NEEDS_REVIEW",
+          reasons: [...final.decision.reasons, "Model runs disagreed — human review required"],
+        },
+      };
     }
+
+    const evidence = final.results
+      .filter((r) => (final.decision.outcome === "negative" ? true : r.kind !== "exclusion") && r.effectiveStatus === "met")
+      .flatMap((r) => r.evidence);
+    const dedup = [...new Map(evidence.map((e) => [`${e.clinicalNoteId}|${e.start}`, e])).values()];
+    events.push({
+      code,
+      complication: checklist.name,
+      stsCode: code,
+      classificationStatus: final.decision.classificationStatus,
+      reviewStatus: final.decision.reviewStatus,
+      outcome: final.decision.outcome,
+      reasons: final.decision.reasons,
+      criteria: final.results,
+      evidence: dedup,
+      eventDate: final.eventDate,
+      eventDateSource: final.eventDateSource,
+      timeframe: { status: final.timeframe, window: describeWindow(window), classes: checklist.timeframe.raw },
+      agreement,
+      explanation: final.explanation,
+      issues: final.issues,
+      modelUsed: final.model,
+      rule: { id: rule.id, pageNumber: rule.pageNumber, sectionName: rule.sectionName },
+    });
   }
 
-  const events = validation.events;
+  const modelUsed = escalated ? `${adjudicator} + ${cfg.escalation} (tie-break)` : adjudicator;
   let ids: string[] = [];
   if (!opts.evaluationModel) {
-    ids = await persist(encounterId, events, ctxFor(modelUsed, prompt.version, manual.id, manual.version, libraryVersion, cacheKey, escalated, opts.jobId));
-    const payload: CachedPayload = {
-      events: events.map(serialize),
-      modelUsed,
-      escalated,
-      escalationReasons,
-      manualSelection: selection.selection,
-      passagesSent: prep.passages.length,
-    };
+    ids = await persist(encounterId, events, {
+      promptVersion: prompt.version,
+      manualVersionId: manual.id,
+      libraryVersion: lib?.version ?? null,
+      cacheKey,
+      jobId: opts.jobId,
+    });
+    const payload = { modelUsed, escalated, notesScreened: inScope.length, passagesSent, codesFlagged: flagged.length, manualSelection: selection.selection };
     await prisma.classificationCache.upsert({
       where: { cacheKey },
       create: {
@@ -364,9 +449,9 @@ export async function classifyEncounter(encounterId: string, opts: ClassifyOptio
         model: modelUsed,
         promptVersion: prompt.version,
         manualVersion: manual.version,
-        result: payload as unknown as Prisma.InputJsonValue,
+        result: payload as Prisma.InputJsonValue,
       },
-      update: { result: payload as unknown as Prisma.InputJsonValue, model: modelUsed, invalidatedAt: null },
+      update: { result: payload as Prisma.InputJsonValue, model: modelUsed, invalidatedAt: null },
     });
   }
   return {
@@ -377,40 +462,18 @@ export async function classifyEncounter(encounterId: string, opts: ClassifyOptio
     escalated,
     escalationReasons,
     modelUsed,
-    costUsd: totalCost,
-    passagesSent: prep.passages.length,
+    costUsd: cost.total,
+    passagesSent,
+    notesScreened: inScope.length,
   };
 }
 
-type PersistCtx = {
-  modelVersion: string;
-  promptVersion: string;
-  manualVersionId: string;
-  manualVersion: string;
-  libraryVersion: number | null;
-  cacheKey: string;
-  escalated: boolean;
-  jobId?: string | null;
-};
-
-function ctxFor(
-  modelVersion: string,
-  promptVersion: string,
-  manualVersionId: string,
-  manualVersion: string,
-  libraryVersion: number | null,
-  cacheKey: string,
-  escalated: boolean,
-  jobId?: string | null,
-): PersistCtx {
-  return { modelVersion, promptVersion, manualVersionId, manualVersion, libraryVersion, cacheKey, escalated, jobId };
-}
-
-/**
- * Persist validated events. Earlier AI predictions for the encounter that no reviewer has
- * touched are superseded (kept for audit); reviewed predictions are never modified.
- */
-async function persist(encounterId: string, events: ValidatedEvent[], ctx: PersistCtx): Promise<string[]> {
+/** Supersede untouched earlier AI predictions (kept for audit) and store the new per-code decisions. */
+async function persist(
+  encounterId: string,
+  events: EncounterEvent[],
+  ctx: { promptVersion: string; manualVersionId: string; libraryVersion: number | null; cacheKey: string; jobId?: string | null },
+): Promise<string[]> {
   return prisma.$transaction(async (tx) => {
     await tx.complicationPrediction.updateMany({
       where: { encounterId, supersededAt: null, classificationStatus: { not: "REVIEWER_ADDED" }, reviews: { none: {} } },
@@ -426,25 +489,32 @@ async function persist(encounterId: string, events: ValidatedEvent[], ctx: Persi
           stsCode: e.stsCode,
           complicationEventDate: e.eventDate,
           classificationStatus: e.classificationStatus,
-          eventAssertion: e.assertion,
-          evidenceStatus: e.evidenceStatus,
+          eventAssertion: e.outcome,
+          evidenceStatus: e.outcome === "positive" ? "supported" : e.outcome === "uncertain" ? "insufficient" : "not_met",
           reviewStatus: e.reviewStatus,
-          confidenceScore: e.confidenceScore,
-          uncertainty: e.uncertainty,
+          confidenceScore: null, // no uncalibrated self-reported confidence; see agreement + criteria instead
+          uncertainty: e.outcome === "uncertain" || e.agreement.startsWith("split") ? "high" : e.issues.length ? "medium" : "low",
           clinicalEvidence: e.evidence
             .map((x) => x.excerpt)
             .join("\n---\n")
             .slice(0, 8000),
           aiExplanation: e.explanation,
-          validationIssues: e.issues.length ? e.issues : undefined,
-          manualReferenceId: e.rule?.id ?? null,
+          validationIssues: [...e.reasons, ...e.issues].length ? [...e.reasons, ...e.issues] : undefined,
+          criteriaResults: e.criteria as unknown as Prisma.InputJsonValue,
+          timeframeCheck: {
+            ...e.timeframe,
+            eventDate: e.eventDate ? e.eventDate.toISOString().slice(0, 10) : null,
+            eventDateSource: e.eventDateSource,
+          } as Prisma.InputJsonValue,
+          agreement: e.agreement,
+          manualReferenceId: e.rule.id,
           manualVersionId: ctx.manualVersionId,
-          manualPage: e.rule?.pageNumber ?? null,
-          manualSection: e.rule?.sectionName ?? null,
-          modelVersion: ctx.modelVersion,
+          manualPage: e.rule.pageNumber,
+          manualSection: e.rule.sectionName,
+          modelVersion: e.modelUsed,
           promptVersion: ctx.promptVersion,
           exampleLibraryVersion: ctx.libraryVersion,
-          escalated: ctx.escalated,
+          escalated: e.agreement.includes("tie-break by"),
           cacheKey: ctx.cacheKey,
           evidence: {
             create: e.evidence.map((x) => ({
@@ -452,7 +522,7 @@ async function persist(encounterId: string, events: ValidatedEvent[], ctx: Persi
               evidenceText: x.excerpt,
               evidenceStart: x.start,
               evidenceEnd: x.end,
-              evidenceType: e.assertion,
+              evidenceType: e.outcome,
               verified: x.verified,
             })),
           },

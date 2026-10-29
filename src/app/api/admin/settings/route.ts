@@ -13,7 +13,7 @@ export async function GET() {
   });
 }
 
-const EDITABLE = ["processingLimits", "modelPricing", "retrieval", "labelMap", "highRiskTerms", "embedNotesAuthorized"] as const;
+const EDITABLE = ["pipeline", "processingLimits", "modelPricing", "retrieval", "labelMap", "highRiskTerms", "embedNotesAuthorized"] as const;
 const putSchema = z.object({ key: z.enum(EDITABLE), value: z.unknown() });
 
 export async function PUT(req: Request) {

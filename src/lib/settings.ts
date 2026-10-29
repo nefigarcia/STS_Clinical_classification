@@ -25,7 +25,20 @@ export const retrievalSchema = z.object({
   passageOverlap: z.number().int().min(0).max(1000),
 });
 
+/** Staged pipeline: full-coverage screening → per-code checklist adjudication → consistency. */
+export const pipelineSchema = z.object({
+  /** "full": screen every note in the STS window (audit-grade recall). "lexicon": screen keyword-selected passages only (cheaper). */
+  screeningMode: z.enum(["full", "lexicon"]),
+  /** Independent adjudication runs per flagged code; disagreement triggers the escalation model and human review. */
+  consistencyRuns: z.number().int().min(1).max(3),
+  /** STS field SeqNo(s) whose codes are the complications to detect (CHSD Postoperative Events = 4740). */
+  eventFieldSeqNos: z.array(z.string()).min(1),
+  screenChunkChars: z.number().int().min(2000).max(40000),
+  maxPassagesPerCode: z.number().int().min(2).max(40),
+});
+
 export const settingsSchemas = {
+  pipeline: pipelineSchema,
   processingLimits: processingLimitsSchema,
   /** Prices are entered by an administrator from the current OpenAI price sheet; never assumed. */
   modelPricing: z.record(z.string(), modelPriceSchema),
@@ -43,9 +56,10 @@ export type SettingKey = keyof typeof settingsSchemas;
 export type SettingValue<K extends SettingKey> = z.infer<(typeof settingsSchemas)[K]>;
 
 export const settingDefaults: { [K in SettingKey]: SettingValue<K> } = {
+  pipeline: { screeningMode: "full", consistencyRuns: 2, eventFieldSeqNos: ["4740"], screenChunkChars: 12000, maxPassagesPerCode: 12 },
   processingLimits: {
-    maxJobTokenBudget: 2_000_000,
-    maxEncounterCostUsd: 2,
+    maxJobTokenBudget: 20_000_000,
+    maxEncounterCostUsd: 10,
     maxEscalationRate: 0.25,
     concurrency: 2,
     retryLimit: 3,
