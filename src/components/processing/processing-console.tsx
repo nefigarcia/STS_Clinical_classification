@@ -28,6 +28,8 @@ type Job = {
   startedAt: string | null;
   completedAt: string | null;
   lastTickAt: string | null;
+  lockedUntil?: string | null;
+  result?: { progress?: { stage: string; done: number; total: number; detail?: string; at: string } } | null;
   errors: { at: string; ref: string | null; message: string }[] | null;
 };
 type Detail = {
@@ -147,7 +149,7 @@ export function ProcessingConsole({ canRun, gateReasons }: { canRun: boolean; ga
                   </Button>
                 )}
                 {["PAUSED", "FAILED"].includes(j.processingStatus) ||
-                (j.processingStatus === "RUNNING" && j.lastTickAt && loadedAt - new Date(j.lastTickAt).getTime() > 6 * 60_000) ? (
+                (j.processingStatus === "RUNNING" && j.lastTickAt && loadedAt - new Date(j.lastTickAt).getTime() > 3 * 60_000) ? (
                   <Button size="sm" onClick={() => act("resume")}>
                     <Play aria-hidden /> Resume
                   </Button>
@@ -173,6 +175,14 @@ export function ProcessingConsole({ canRun, gateReasons }: { canRun: boolean; ga
                   <span className="tabular-nums">{pct}%</span>
                 </div>
                 <Progress value={pct} aria-label="Job progress" />
+                {ACTIVE.includes(j.processingStatus) && j.result?.progress && (
+                  <p className="mt-1.5 text-xs text-muted-foreground" aria-live="polite">
+                    Current encounter: {j.result.progress.stage === "screening" ? "screening note text" : "adjudicating flagged STS codes"}{" "}
+                    {j.result.progress.done}/{j.result.progress.total}
+                    {j.result.progress.detail ? ` (${j.result.progress.detail})` : ""}
+                    {j.lastTickAt && ` · heartbeat ${formatDate(j.lastTickAt, true)}`}
+                  </p>
+                )}
               </div>
               <dl className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
                 {[

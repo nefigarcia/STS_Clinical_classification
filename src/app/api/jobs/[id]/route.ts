@@ -43,6 +43,10 @@ export async function PATCH(req: NextRequest, ctx: RouteContext<"/api/jobs/[id]"
       await prisma.processingJob.update({ where: { id }, data: { processingStatus: "CANCELLED", completedAt: new Date() } });
       await prisma.jobItem.updateMany({ where: { jobId: id, status: "PENDING" }, data: { status: "SKIPPED" } });
     } else {
+      // A live invocation keeps its lease fresh (heartbeat); resuming it would process items twice.
+      if (job.processingStatus === "RUNNING" && job.lockedUntil && job.lockedUntil > new Date()) {
+        throw new ApiError(409, "This job is actively running; resume is only needed for paused or interrupted jobs");
+      }
       // resume (interrupted/paused) or retry failed items
       if (action === "retry_failed") {
         const n = await prisma.jobItem.updateMany({ where: { jobId: id, status: "FAILED" }, data: { status: "PENDING", error: null } });

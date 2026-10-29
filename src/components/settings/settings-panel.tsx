@@ -16,7 +16,14 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { NativeSelectClass, formatDate } from "@/components/common";
 
 type Settings = {
-  pipeline: { screeningMode: "full" | "lexicon"; consistencyRuns: number; eventFieldSeqNos: string[]; screenChunkChars: number; maxPassagesPerCode: number };
+  pipeline: {
+    profile?: "audit" | "economy" | "custom";
+    screeningMode: "full" | "lexicon";
+    consistencyRuns: number;
+    eventFieldSeqNos: string[];
+    screenChunkChars: number;
+    maxPassagesPerCode: number;
+  };
   processingLimits: {
     maxJobTokenBudget: number;
     maxEncounterCostUsd: number;
@@ -183,7 +190,15 @@ export function SettingsPanel({ isAdmin }: { isAdmin: boolean }) {
       </div>
 
       <PipelineCard value={s.pipeline} disabled={!isAdmin} onSave={(v) => save("pipeline", v)} />
-      <LimitsCard value={s.processingLimits} disabled={!isAdmin} onSave={(v) => save("processingLimits", v)} />
+      <details className="rounded-xl border bg-white p-4">
+        <summary className="cursor-pointer text-sm font-semibold">Advanced: budgets and speed limits</summary>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Defaults are tuned for audit work (8 parallel AI calls, generous token budget). Change only to cap spending or if OpenAI rate limits are hit.
+        </p>
+        <div className="mt-3">
+          <LimitsCard value={s.processingLimits} disabled={!isAdmin} onSave={(v) => save("processingLimits", v)} />
+        </div>
+      </details>
 
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
@@ -253,7 +268,7 @@ function LimitsCard({
     ["maxJobTokenBudget", "Max job token budget", "tokens"],
     ["maxEncounterCostUsd", "Max per-encounter cost", "USD"],
     ["maxEscalationRate", "Max escalation rate", "0-1"],
-    ["concurrency", "Concurrency", "workers"],
+    ["concurrency", "Parallel AI calls", "1–16"],
     ["retryLimit", "Request retry limit", "retries"],
     ["dailyCostLimitUsd", "Daily API cost limit", "USD"],
   ];
@@ -674,86 +689,115 @@ function AuditCard() {
   );
 }
 
+const PROFILE_INFO = {
+  audit: {
+    title: "Audit-grade (recommended)",
+    body: "Reads all new text in every note in the STS window, then checks each possible complication twice against its STS checklist. Disagreements go to the stronger model and always to a reviewer. Highest recall.",
+  },
+  economy: {
+    title: "Economy",
+    body: "Reads only keyword-matched passages and checks each complication once (high-risk codes still twice). Faster and cheaper, but can miss events described in unusual wording. Not recommended for audit work.",
+  },
+  custom: { title: "Custom", body: "Use the advanced values below." },
+} as const;
+
 function PipelineCard({ value, disabled, onSave }: { value: Settings["pipeline"]; disabled: boolean; onSave: (v: Settings["pipeline"]) => void }) {
   const [v, setV] = useState(value);
+  const profile = v.profile ?? "audit";
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Classification pipeline</CardTitle>
+        <CardTitle>Classification profile</CardTitle>
         <CardDescription>
-          Full screening checks every note in the STS window against all event codes (audit-grade recall; higher cost). Each flagged code is then judged against
-          its STS checklist; with 2+ consistency runs, any disagreement is sent to the escalation model and always to human review.
+          Choose how thoroughly notes are read. Speed and cost optimizations (copy-forward removal, batching, prompt caching, parallel calls, resumable work)
+          are automatic in every profile.
         </CardDescription>
       </CardHeader>
-      <CardContent className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-        <div className="space-y-1">
-          <Label htmlFor="sm">Screening</Label>
-          <select
-            id="sm"
-            className={`${NativeSelectClass} w-full`}
-            disabled={disabled}
-            value={v.screeningMode}
-            onChange={(e) => setV({ ...v, screeningMode: e.target.value as "full" | "lexicon" })}
-          >
-            <option value="full">Full — every note (recommended)</option>
-            <option value="lexicon">Keyword passages only (cheaper, lower recall)</option>
-          </select>
-        </div>
-        <div className="space-y-1">
-          <Label htmlFor="cr">Consistency runs</Label>
-          <Input
-            id="cr"
-            type="number"
-            min={1}
-            max={3}
-            disabled={disabled}
-            value={v.consistencyRuns}
-            onChange={(e) => setV({ ...v, consistencyRuns: Number(e.target.value) })}
-          />
-        </div>
-        <div className="space-y-1">
-          <Label htmlFor="ef">Event field SeqNo(s)</Label>
-          <Input
-            id="ef"
-            disabled={disabled}
-            value={v.eventFieldSeqNos.join(", ")}
-            onChange={(e) =>
-              setV({
-                ...v,
-                eventFieldSeqNos: e.target.value
-                  .split(",")
-                  .map((s) => s.trim())
-                  .filter(Boolean),
-              })
-            }
-          />
-        </div>
-        <div className="space-y-1">
-          <Label htmlFor="cc">Screen chunk (chars)</Label>
-          <Input
-            id="cc"
-            type="number"
-            disabled={disabled}
-            value={v.screenChunkChars}
-            onChange={(e) => setV({ ...v, screenChunkChars: Number(e.target.value) })}
-          />
-        </div>
-        <div className="space-y-1">
-          <Label htmlFor="mp">Max passages per code</Label>
-          <Input
-            id="mp"
-            type="number"
-            disabled={disabled}
-            value={v.maxPassagesPerCode}
-            onChange={(e) => setV({ ...v, maxPassagesPerCode: Number(e.target.value) })}
-          />
-        </div>
-        {!disabled && (
-          <div className="sm:col-span-2 lg:col-span-5">
-            <Button size="sm" onClick={() => onSave(v)}>
-              Save pipeline
-            </Button>
+      <CardContent className="space-y-3">
+        <fieldset className="grid gap-2 md:grid-cols-2" disabled={disabled}>
+          <legend className="sr-only">Classification profile</legend>
+          {(["audit", "economy"] as const).map((k) => (
+            <label key={k} className={`flex cursor-pointer gap-2 rounded-lg border p-3 ${profile === k ? "border-primary bg-primary/5" : ""}`}>
+              <input type="radio" name="profile" className="mt-1" checked={profile === k} onChange={() => setV({ ...v, profile: k })} />
+              <span>
+                <span className="block text-sm font-medium">{PROFILE_INFO[k].title}</span>
+                <span className="block text-xs text-muted-foreground">{PROFILE_INFO[k].body}</span>
+              </span>
+            </label>
+          ))}
+        </fieldset>
+        <details className="rounded-lg border p-3" open={profile === "custom"}>
+          <summary className="cursor-pointer text-sm font-medium">Advanced (custom)</summary>
+          <p className="mt-1 text-xs text-muted-foreground">Changing any value switches the profile to Custom. Most installations should not need this.</p>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+            <div className="space-y-1">
+              <Label htmlFor="sm">Screening</Label>
+              <select
+                id="sm"
+                className={`${NativeSelectClass} w-full`}
+                disabled={disabled}
+                value={v.screeningMode}
+                onChange={(e) => setV({ ...v, profile: "custom", screeningMode: e.target.value as "full" | "lexicon" })}
+              >
+                <option value="full">All new note text</option>
+                <option value="lexicon">Keyword passages only</option>
+              </select>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="cr">Consistency runs</Label>
+              <Input
+                id="cr"
+                type="number"
+                min={1}
+                max={3}
+                disabled={disabled}
+                value={v.consistencyRuns}
+                onChange={(e) => setV({ ...v, profile: "custom", consistencyRuns: Number(e.target.value) })}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="ef">Event field SeqNo(s)</Label>
+              <Input
+                id="ef"
+                disabled={disabled}
+                value={v.eventFieldSeqNos.join(", ")}
+                onChange={(e) =>
+                  setV({
+                    ...v,
+                    eventFieldSeqNos: e.target.value
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter(Boolean),
+                  })
+                }
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="cc">Text per AI call (chars)</Label>
+              <Input
+                id="cc"
+                type="number"
+                disabled={disabled}
+                value={v.screenChunkChars}
+                onChange={(e) => setV({ ...v, profile: "custom", screenChunkChars: Number(e.target.value) })}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="mp">Max passages per code</Label>
+              <Input
+                id="mp"
+                type="number"
+                disabled={disabled}
+                value={v.maxPassagesPerCode}
+                onChange={(e) => setV({ ...v, profile: "custom", maxPassagesPerCode: Number(e.target.value) })}
+              />
+            </div>
           </div>
+        </details>
+        {!disabled && (
+          <Button size="sm" onClick={() => onSave(v)}>
+            Save profile
+          </Button>
         )}
       </CardContent>
     </Card>
@@ -805,7 +849,7 @@ function ResetCard() {
         ["Classification / evaluation jobs", c.jobs],
         ["AI usage records", c.aiCalls],
         ["Evaluation runs", c.evaluationRuns],
-        ...(screening ? ([["Note screening cache entries", c.screeningCache]] as [string, number | null][]) : []),
+        ...(screening ? ([["Cached AI responses (screening + adjudication)", c.screeningCache]] as [string, number | null][]) : []),
       ]
     : [];
 
@@ -847,9 +891,10 @@ function ResetCard() {
             <label className="flex items-start gap-2 text-sm">
               <input type="checkbox" className="mt-1" checked={screening} onChange={(e) => setScreening(e.target.checked)} />
               <span>
-                Also delete the note screening cache
+                Also delete cached AI responses
                 <span className="block text-xs text-muted-foreground">
-                  Forces every note to be read again by the AI on the next run (higher cost). Leave unchecked to re-run only the per-code decisions.
+                  Forces the AI to read every note and re-decide every code again on the next run (full cost). Leave unchecked to rebuild results from stored AI
+                  responses at no cost.
                 </span>
               </span>
             </label>

@@ -9,3 +9,4 @@ storage
 *.md
 package-lock.json
 src/components/ui
+.claude

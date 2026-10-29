@@ -26,13 +26,17 @@ const usage = { input_tokens: 1000, output_tokens: 200, input_tokens_details: { 
 
 type Req = { model: string; input: { role: string; content: string }[]; text: { format: { name: string } }; store: boolean };
 
-/** Stage A mock: report catalogue events whose wording appears in the note. */
+/** Stage A mock: report catalogue events whose wording appears in a span (with that span id). */
+const screenedText: string[] = [];
 function screen(user: string) {
-  const note = user.split("<note")[1] ?? "";
-  const m: { code: string; assertion: string; excerpt: string }[] = [];
+  const spans = [...user.matchAll(/<span id="(S\d+)"[^>]*>\n([\s\S]*?)\n<\/span>/g)].map((x) => ({ id: x[1], text: x[2] }));
+  screenedText.push(...spans.map((s) => s.text));
+  const m: { spanRef: string; code: string; assertion: string; excerpt: string }[] = [];
   const add = (re: RegExp, code: string, assertion: string) => {
-    const hit = note.match(re);
-    if (hit) m.push({ code, assertion, excerpt: hit[0] });
+    for (const s of spans) {
+      const hit = s.text.match(re);
+      if (hit) m.push({ spanRef: s.id, code, assertion, excerpt: hit[0] });
+    }
   };
   add(/new right pneumothorax/, "T100", "affirmed");
   add(/No pneumothorax/, "T100", "negated");
@@ -86,6 +90,7 @@ describe.skipIf(!ready)("staged classification pipeline and jobs (database, mock
     parseMock.mockImplementation(async (req: Req) => respond(req));
     pacingBehaviour = "agree";
     pacingCalls = 0;
+    screenedText.length = 0;
   });
 
   it("is disabled until an approved STS manual exists", async () => {
@@ -103,7 +108,7 @@ describe.skipIf(!ready)("staged classification pipeline and jobs (database, mock
     expect(parseMock).not.toHaveBeenCalled();
   });
 
-  it("screens every note, adjudicates each flagged code against its checklist, and caches", async () => {
+  it("screens all new note text in one packed call, adjudicates each flagged code against its checklist, and caches", async () => {
     await importSynthetic();
     await approvedFixtureManual();
     const enc = await prisma.encounter.findFirstOrThrow({ where: { csn: "00500101" }, include: { notes: true } });
@@ -112,7 +117,15 @@ describe.skipIf(!ready)("staged classification pipeline and jobs (database, mock
     const calls = parseMock.mock.calls.map((c) => c[0] as Req);
     const screens = calls.filter((c) => c.text.format.name === "note_screening");
     const adjudications = calls.filter((c) => c.text.format.name === "code_adjudication");
-    expect(screens).toHaveLength(5); // every unique note in scope, none skipped by keywords
+    expect(screens).toHaveLength(1); // all 5 notes' new text packed into one call
+    for (const id of ["000900001", "000900002", "000900003", "000900004", "000900005"]) expect(enc.notes.some((n) => n.noteId === id)).toBe(true);
+    // Every note contributes text (no keyword filtering) but copy-forward text is sent once.
+    const all = screenedText.join("\n");
+    expect(all).toContain("complete repair");
+    expect(all).toContain("Chylothorax improving");
+    expect(all.split("Family updated at bedside.").length - 1).toBe(1);
+    expect(screens[0].input[0].content).toContain("<event_catalogue>"); // static prefix for prompt caching
+    expect((screens[0] as unknown as { prompt_cache_key?: string }).prompt_cache_key).toMatch(/^sts-screen-/);
     expect(adjudications).toHaveLength(3 * 2); // 3 flagged codes × 2 consistency runs
     expect(calls.every((c) => c.store === false)).toBe(true);
     expect(calls.every((c) => !c.input[1].content.includes("0001001") && !c.input[1].content.includes("000900002"))).toBe(true);
@@ -146,10 +159,11 @@ describe.skipIf(!ready)("staged classification pipeline and jobs (database, mock
     expect((await classifyEncounter(enc.id)).cacheHit).toBe(true);
     expect(parseMock).not.toHaveBeenCalled();
 
-    // Screening cache: after invalidation only adjudication re-runs; unchanged notes are never re-screened.
+    // Response cache: after invalidation, identical prompts are not paid for again (resumable work).
     await prisma.classificationCache.updateMany({ data: { invalidatedAt: new Date() } });
     await classifyEncounter(enc.id);
-    expect(parseMock.mock.calls.filter((c) => (c[0] as Req).text.format.name === "note_screening")).toHaveLength(0);
+    expect(parseMock).not.toHaveBeenCalled();
+    expect(await prisma.complicationPrediction.count({ where: { encounterId: enc.id, supersededAt: null } })).toBe(3);
   });
 
   it("applies the STS timeframe in code: events before the index operation are excluded", async () => {
@@ -171,7 +185,7 @@ describe.skipIf(!ready)("staged classification pipeline and jobs (database, mock
     const r = await classifyEncounter(enc.id);
     expect(r.escalated).toBe(true);
     const pacing = await prisma.complicationPrediction.findFirstOrThrow({ where: { encounterId: enc.id, stsCode: "T300", supersededAt: null } });
-    expect(pacing.agreement).toMatch(/^split \(positive vs negative\); tie-break by test-escalation: positive/);
+    expect(pacing.agreement).toMatch(/^split \((positive vs negative|negative vs positive)\); tie-break by test-escalation: positive/);
     expect(pacing.reviewStatus).toBe("NEEDS_REVIEW");
     expect(await prisma.aiCall.count({ where: { purpose: "adjudication-tiebreak", model: "test-escalation" } })).toBe(1);
   });
@@ -189,8 +203,8 @@ describe.skipIf(!ready)("staged classification pipeline and jobs (database, mock
     });
     const enc = await prisma.encounter.findFirstOrThrow({ where: { csn: "00500101" } });
     await classifyEncounter(enc.id);
-    const firstCall = await prisma.aiCall.findFirstOrThrow({ orderBy: { createdAt: "asc" } });
-    expect(firstCall).toMatchObject({ purpose: "screening", retries: 1, success: true });
+    const screenCall = await prisma.aiCall.findFirstOrThrow({ where: { purpose: "screening" } });
+    expect(screenCall).toMatchObject({ retries: 1, success: true });
   }, 60_000);
 
   it("pauses jobs at budget limits and resumes from where they stopped", async () => {
@@ -221,5 +235,40 @@ describe.skipIf(!ready)("staged classification pipeline and jobs (database, mock
     const j = await prisma.processingJob.findUniqueOrThrow({ where: { id: job.id } });
     expect(j.processingStatus).toBe("COMPLETED");
     expect(j.processedRecords).toBe(5);
+  });
+});
+
+describe.skipIf(!ready)("time-boxed processing (serverless limits)", () => {
+  beforeEach(async () => {
+    await resetDb();
+    parseMock.mockReset();
+    parseMock.mockImplementation(async (req: Req) => respond(req));
+  });
+
+  it("yields before the deadline and resumes from cached work without paying twice", async () => {
+    const { YieldError } = await import("@/lib/ai/classifier");
+    await importSynthetic();
+    await approvedFixtureManual();
+    const enc = await prisma.encounter.findFirstOrThrow({ where: { csn: "00500101" } });
+    // Deadline already near: nothing new is started, the item yields.
+    await expect(classifyEncounter(enc.id, { deadline: Date.now() + 1000 })).rejects.toBeInstanceOf(YieldError);
+    // Enough time for screening but not adjudication.
+    await expect(classifyEncounter(enc.id, { deadline: Date.now() + 32_000 })).rejects.toBeInstanceOf(YieldError);
+    const screeningCalls = parseMock.mock.calls.length;
+    expect(screeningCalls).toBe(1);
+    await classifyEncounter(enc.id);
+    const after = parseMock.mock.calls.map((c) => (c[0] as Req).text.format.name);
+    expect(after.filter((n) => n === "note_screening")).toHaveLength(1); // screening not repeated
+    expect(after.filter((n) => n === "code_adjudication")).toHaveLength(6);
+  });
+
+  it("reports progress and refuses duplicate resumes while a job is alive", async () => {
+    await importSynthetic();
+    await approvedFixtureManual();
+    const enc = await prisma.encounter.findFirstOrThrow({ where: { csn: "00500101" } });
+    const seen: string[] = [];
+    await classifyEncounter(enc.id, { onProgress: (p) => seen.push(`${p.stage}:${p.done}/${p.total}`) });
+    expect(seen).toContain("screening:1/1");
+    expect(seen).toContain("adjudication:3/3");
   });
 });

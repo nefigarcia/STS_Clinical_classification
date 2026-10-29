@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { buildChecklist, isScreenableCode, parseTimeframeClasses } from "@/lib/sts/criteria";
 import { checkEventDate, computeWindow } from "@/lib/ai/timeframe";
 import { adjudicationSchema, buildAdjudicationPrompt, decide, validateAdjudication, type Passage } from "@/lib/ai/adjudication";
-import { screenSchema, validateScreen } from "@/lib/ai/screening";
+import { novelSpans, packBatches, screenSchema, validateScreen } from "@/lib/ai/screening";
+import { mapPool } from "@/lib/util/pool";
 import { locateExcerpt } from "@/lib/ai/excerpt";
 import { computeCost } from "@/lib/ai/cost-tracker";
 
@@ -169,31 +170,86 @@ describe("adjudication validation and deterministic decision", () => {
   });
 });
 
-describe("screening validation", () => {
-  it("keeps only catalogue codes with verbatim quotes and returns note-level offsets", () => {
-    const text = "Overnight JET treated with temporary pacing. No pneumothorax.";
+describe("screening: copy-forward removal, batching, validation", () => {
+  const note = (id: string, day: number, text: string) => ({ id, combinedNoteText: text, noteType: "ICU Progress Note", dateOfService: d(`2026-01-0${day}`) });
+
+  it("screens only sentences not seen earlier in the encounter, with exact note offsets", () => {
+    const n1 = note("a", 1, "Vitals stable. Plan per team. New right pneumothorax; chest tube placed.");
+    const n2 = note("b", 2, "Vitals stable.  Plan per team. Chest tube removed today. New right pneumothorax; chest tube placed.");
+    const { spans, totalChars, novelChars } = novelSpans([n1, n2]);
+    expect(spans.map((s) => [s.clinicalNoteId, s.text])).toEqual([
+      ["a", "Vitals stable. Plan per team. New right pneumothorax; chest tube placed."],
+      ["b", "Chest tube removed today."],
+    ]);
+    for (const s of spans) expect([n1, n2].find((n) => n.id === s.clinicalNoteId)!.combinedNoteText.slice(s.start, s.end)).toBe(s.text);
+    expect(novelChars).toBeLessThan(totalChars);
+  });
+
+  it("packs spans from several notes into batches and splits oversized spans", () => {
+    const s = (id: string, len: number) => ({ clinicalNoteId: id, noteType: null, date: null, start: 0, end: len, text: "x".repeat(len) });
+    const batches = packBatches([s("a", 400), s("b", 400), s("c", 400), s("d", 2500)], 1000);
+    expect(batches.map((b) => b.map((x) => `${x.clinicalNoteId}:${x.text.length}`))).toEqual([
+      ["a:400", "b:400"],
+      ["c:400"],
+      ["d:1000"],
+      ["d:1000"],
+      ["d:1000"],
+      ["d:400"],
+    ]);
+    expect(batches[3][0].start).toBe(700); // overlapping split keeps boundary text
+  });
+
+  it("keeps only catalogue codes with verbatim quotes and maps span refs to note offsets", () => {
+    const batch = [
+      { clinicalNoteId: "cn1", noteType: null, date: null, start: 1000, end: 1063, text: "Overnight JET treated with temporary pacing. No pneumothorax." },
+      { clinicalNoteId: "cn2", noteType: null, date: null, start: 50, end: 80, text: "Reintubated for distress." },
+    ];
     const r = validateScreen(
       screenSchema.parse({
         mentions: [
-          { code: "75", assertion: "affirmed", excerpt: "temporary pacing" },
-          { code: "190", assertion: "negated", excerpt: "No pneumothorax" },
-          { code: "999", assertion: "affirmed", excerpt: "JET" },
-          { code: "72", assertion: "possible", excerpt: "not in the text" },
+          { spanRef: "S1", code: "75", assertion: "affirmed", excerpt: "temporary pacing" },
+          { spanRef: "S1", code: "190", assertion: "negated", excerpt: "No pneumothorax" },
+          { spanRef: "S1", code: "999", assertion: "affirmed", excerpt: "JET" },
+          { spanRef: "S1", code: "72", assertion: "possible", excerpt: "not in the text" },
+          { spanRef: "S1", code: "160", assertion: "affirmed", excerpt: "Reintubated" }, // wrong span id, verbatim in S2
         ],
       }),
-      text,
-      1000,
-      "cn1",
-      new Set(["75", "190", "72"]),
+      batch,
+      new Set(["75", "190", "72", "160"]),
     );
-    expect(r.map((m) => [m.code, m.assertion])).toEqual([
-      ["75", "affirmed"],
-      ["190", "negated"],
+    expect(r.map((m) => [m.code, m.clinicalNoteId])).toEqual([
+      ["75", "cn1"],
+      ["190", "cn1"],
+      ["160", "cn2"],
     ]);
-    expect(r[0].start).toBe(1000 + text.indexOf("temporary pacing"));
+    expect(r[0].start).toBe(1000 + batch[0].text.indexOf("temporary pacing"));
+    expect(r[2].start).toBe(50);
   });
 });
 
+describe("mapPool", () => {
+  it("bounds concurrency, preserves order and stops scheduling on request", async () => {
+    let active = 0;
+    let peak = 0;
+    const out = await mapPool([1, 2, 3, 4, 5, 6], 2, async (x) => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 5));
+      active--;
+      return x * 10;
+    });
+    expect(out).toEqual([10, 20, 30, 40, 50, 60]);
+    expect(peak).toBe(2);
+    let started = 0;
+    const partial = await mapPool(
+      [1, 2, 3, 4],
+      1,
+      async (x) => (started++, x),
+      () => started >= 2,
+    );
+    expect(partial).toEqual([1, 2, undefined, undefined]);
+  });
+});
 describe("excerpt location and cost", () => {
   it("tolerates whitespace/case/quote marks but rejects paraphrase", () => {
     expect(locateExcerpt("New right\n pneumothorax noted", "“new RIGHT pneumothorax”")).toEqual({ start: 0, end: 23 });

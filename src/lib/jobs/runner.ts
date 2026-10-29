@@ -53,17 +53,28 @@ async function releaseLease(jobId: string, owner: string) {
   await prisma.processingJob.updateMany({ where: { id: jobId, lockOwner: owner }, data: { lockedUntil: null, lockOwner: null } });
 }
 
+const LEASE_MS = 90_000;
+const HEARTBEAT_MS = 20_000;
+
 export type TickResult = { jobId: string; processed: number; remaining: number; status: string; skipped?: boolean };
 
 /** Process one job until the time budget is spent. Safe to call concurrently (lease-protected). */
 export async function runJobTick(jobId: string, budgetMs = 240_000): Promise<TickResult> {
-  const owner = await acquireLease(jobId, budgetMs + 60_000);
+  // Short lease kept alive by a heartbeat: a crashed invocation frees the job within ~90 s,
+  // while a live one is never mistaken for stalled (no duplicate processing).
+  const owner = await acquireLease(jobId, LEASE_MS);
   if (!owner) {
     const j = await prisma.processingJob.findUnique({ where: { id: jobId }, select: { processingStatus: true } });
     return { jobId, processed: 0, remaining: -1, status: j?.processingStatus ?? "MISSING", skipped: true };
   }
   const deadline = Date.now() + budgetMs;
   let processed = 0;
+  const heartbeat = setInterval(() => {
+    const now = new Date();
+    prisma.processingJob
+      .updateMany({ where: { id: jobId, lockOwner: owner }, data: { lockedUntil: new Date(now.getTime() + LEASE_MS), lastTickAt: now } })
+      .catch(() => undefined);
+  }, HEARTBEAT_MS);
   try {
     const job = await prisma.processingJob.update({ where: { id: jobId }, data: { processingStatus: "RUNNING" } });
     if (!job.startedAt) await prisma.processingJob.update({ where: { id: jobId }, data: { startedAt: new Date() } });
@@ -78,14 +89,14 @@ export async function runJobTick(jobId: string, budgetMs = 240_000): Promise<Tic
       await prisma.jobItem.update({ where: { id: item.id }, data: { status: "RUNNING", attempts: { increment: 1 } } });
       let outcome: HandlerOutcome;
       try {
-        outcome = await handler(job, item);
+        outcome = await handler(job, item, { deadline: deadline - 10_000 });
       } catch (err) {
         outcome = { status: "FAILED", error: errorSummary(err) };
       }
       await prisma.jobItem.update({
         where: { id: item.id },
         data: {
-          status: outcome.status === "PAUSE_JOB" ? "PENDING" : outcome.status,
+          status: outcome.status === "PAUSE_JOB" || outcome.status === "YIELD" ? "PENDING" : outcome.status,
           error: outcome.error ?? null,
           costUsd: outcome.costUsd ?? undefined,
           escalated: outcome.escalated ?? undefined,
@@ -98,6 +109,8 @@ export async function runJobTick(jobId: string, budgetMs = 240_000): Promise<Tic
         break;
       }
       processed++;
+      // Time budget used mid-item: finished work is cached; the next invocation continues this item.
+      if (outcome.status === "YIELD") break;
       await prisma.processingJob.update({
         where: { id: jobId },
         data: {
@@ -125,6 +138,7 @@ export async function runJobTick(jobId: string, budgetMs = 240_000): Promise<Tic
     }
     return { jobId, processed, remaining, status: after.processingStatus };
   } finally {
+    clearInterval(heartbeat);
     // Items left RUNNING by a crashed tick are recovered by recoverStaleItems().
     await releaseLease(jobId, owner);
   }

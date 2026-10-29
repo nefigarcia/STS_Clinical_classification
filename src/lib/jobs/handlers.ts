@@ -1,6 +1,6 @@
 import type { JobItem, JobType, Prisma, ProcessingJob } from "@prisma/client";
 import { prisma } from "@/lib/db/prisma";
-import { classifyEncounter, BudgetExceededError, GateClosedError } from "@/lib/ai/classifier";
+import { classifyEncounter, BudgetExceededError, GateClosedError, YieldError, type ClassifyProgress } from "@/lib/ai/classifier";
 import { modelConfig } from "@/lib/ai/openai-client";
 import { parseAndStoreManual, embedRuleBatch, finishIndexing } from "@/lib/sts/manual-indexer";
 import { prepareHistoricalExample } from "@/lib/validation/historical-prep";
@@ -9,7 +9,8 @@ import { getSetting } from "@/lib/settings";
 import { errorSummary } from "@/lib/security/logger";
 
 export type HandlerOutcome = {
-  status: "DONE" | "FAILED" | "SKIPPED" | "PAUSE_JOB";
+  /** YIELD = time budget used mid-item; the item is retried next tick and continues from cached work. */
+  status: "DONE" | "FAILED" | "SKIPPED" | "PAUSE_JOB" | "YIELD";
   error?: string;
   costUsd?: number | null;
   escalated?: boolean;
@@ -18,7 +19,9 @@ export type HandlerOutcome = {
   newItems?: { refId?: string; encounterId?: string }[];
 };
 
-type Handler = ((job: ProcessingJob, item: JobItem) => Promise<HandlerOutcome>) & {
+export type HandlerCtx = { deadline: number };
+
+type Handler = ((job: ProcessingJob, item: JobItem, ctx: HandlerCtx) => Promise<HandlerOutcome>) & {
   finalize?: (job: ProcessingJob) => Promise<void>;
 };
 
@@ -30,7 +33,20 @@ async function escalationStats(jobId: string) {
   return { escalated, processed };
 }
 
-const classification: Handler = async (job, item) => {
+/** Throttled writer of live progress into ProcessingJob.result (shown on the AI Processing page). */
+function progressWriter(jobId: string, encounterId: string) {
+  let last = 0;
+  return (p: ClassifyProgress) => {
+    const now = Date.now();
+    if (now - last < 2000 && p.done !== p.total) return;
+    last = now;
+    prisma.processingJob
+      .update({ where: { id: jobId }, data: { result: { progress: { ...p, encounterId, at: new Date(now).toISOString() } } as Prisma.InputJsonValue } })
+      .catch(() => undefined);
+  };
+}
+
+const classification: Handler = async (job, item, ctx) => {
   if (!item.encounterId) return { status: "SKIPPED", error: "No encounter" };
   const params = (job.params ?? {}) as { forceEscalation?: boolean };
   try {
@@ -38,9 +54,12 @@ const classification: Handler = async (job, item) => {
       jobId: job.id,
       forceEscalation: params.forceEscalation,
       escalationStats: await escalationStats(job.id),
+      deadline: ctx.deadline,
+      onProgress: progressWriter(job.id, item.encounterId),
     });
     return { status: "DONE", costUsd: r.costUsd, escalated: r.escalated, cacheHit: r.cacheHit, model: r.modelUsed };
   } catch (err) {
+    if (err instanceof YieldError) return { status: "YIELD" };
     if (err instanceof BudgetExceededError || err instanceof GateClosedError) {
       return { status: "PAUSE_JOB", error: err.message, model: modelConfig().primary };
     }
@@ -83,11 +102,11 @@ const historicalPrep: Handler = async (_job, item) => {
   return { status: r.skipped ? "SKIPPED" : "DONE" };
 };
 
-const evaluation: Handler = async (job, item) => {
+const evaluation: Handler = async (job, item, ctx) => {
   if (!item.encounterId) return { status: "SKIPPED" };
   const params = (job.params ?? {}) as { model: string; evaluationRunId: string };
   try {
-    const r = await classifyEncounter(item.encounterId, { jobId: job.id, evaluationModel: params.model });
+    const r = await classifyEncounter(item.encounterId, { jobId: job.id, evaluationModel: params.model, deadline: ctx.deadline });
     const run = await prisma.evaluationRun.findUniqueOrThrow({ where: { id: params.evaluationRunId } });
     const results = (Array.isArray(run.results) ? run.results : []) as unknown as { encounterId: string; predicted: unknown[] }[];
     results.push({
@@ -104,6 +123,7 @@ const evaluation: Handler = async (job, item) => {
     await prisma.evaluationRun.update({ where: { id: run.id }, data: { results: results as unknown as Prisma.InputJsonValue, status: "RUNNING" } });
     return { status: "DONE", costUsd: r.costUsd, model: r.modelUsed };
   } catch (err) {
+    if (err instanceof YieldError) return { status: "YIELD" };
     if (err instanceof BudgetExceededError || err instanceof GateClosedError) return { status: "PAUSE_JOB", error: err.message };
     return { status: "FAILED", error: errorSummary(err) };
   }

@@ -203,6 +203,17 @@ Classification is built to be audit-grade: high recall, a criterion-by-criterion
    - Reviewed predictions are never modified.
    - **Nothing is ever auto-approved.**
 
+**Speed and cost optimizations (automatic):**
+- **Copy-forward removal:** only sentences not already seen earlier in the encounter are screened. On the reference data, about 76% of note text is repeated from earlier notes.
+- **Packing:** new text from several notes goes into each call, up to 12,000 characters.
+- **Prompt caching:** instructions, the event catalogue and per-code STS definitions form fixed prefixes with a `prompt_cache_key`, so they are billed at the cached-input rate.
+- **Parallel calls:** 8 at a time by default; consistency runs also run in parallel.
+- **Response cache:** every screening and adjudication response is stored, so interrupted or repeated work is never paid for twice.
+- **Time-boxed processing:** an encounter stops safely before the serverless time limit and the next run continues from cached work. A heartbeat keeps the job lease alive, and Resume is refused while a job is actively running.
+
+On the two real reference encounters, screening dropped from 912 to 132 calls and note text sent from 6.4 M to 1.5 M characters.
+
+Settings offer two profiles: **Audit-grade** (recommended) and **Economy**. Advanced values are under a collapsed section.
 **Encounter dates drive the timeframe.** The review screen has fields for the index operation date, OR exit, hospital discharge and database discharge. Missing values are marked "derived" or "unknown": hospital discharge falls back to the latest Discharge Summary date. Ideally these come from the EHR; changing them changes the cache key.
 
 **Cost controls (Settings):**

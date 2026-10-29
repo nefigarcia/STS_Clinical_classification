@@ -1,7 +1,8 @@
 import type { ClassificationStatus, ClinicalNote, Prisma, ReviewStatus, STSManualRule } from "@prisma/client";
 import { prisma } from "@/lib/db/prisma";
 import { sha256, dateKey } from "@/lib/data/normalization";
-import { getSetting } from "@/lib/settings";
+import { effectivePipeline, getSetting } from "@/lib/settings";
+import { mapPool } from "@/lib/util/pool";
 import { classificationGate, encounterClassification } from "@/lib/security/gates";
 import { buildChecklist, isScreenableCode, type CodeChecklist } from "@/lib/sts/criteria";
 import { modelConfig } from "./openai-client";
@@ -10,8 +11,8 @@ import { prepareEncounterPassages } from "./candidate-detection";
 import { selectManualVersion } from "./sts-rules";
 import { retrieveExamples } from "./evidence-retrieval";
 import { activePrompt } from "./prompts";
-import { callStructured } from "./model-call";
-import { noteSegments, screenSegment, type CatalogueEntry, type ScreenMention } from "./screening";
+import { cachedStructured } from "./model-call";
+import { novelSpans, packBatches, screenBatch, type CatalogueEntry, type ScreenMention, type Span } from "./screening";
 import {
   adjudicationSchema,
   buildAdjudicationPrompt,
@@ -38,9 +39,16 @@ export const OUTPUT_SCHEMA_VERSION = "2";
 
 export class BudgetExceededError extends Error {}
 export class GateClosedError extends Error {}
+/** Thrown when the time budget is nearly used; all finished work is cached, so the next run continues where this stopped. */
+export class YieldError extends Error {}
+
+export type ClassifyProgress = { stage: "screening" | "adjudication"; done: number; total: number; detail?: string };
 
 export type ClassifyOptions = {
   jobId?: string | null;
+  /** Epoch ms by which this invocation must stop (serverless time limit). Work yields safely before it. */
+  deadline?: number;
+  onProgress?: (p: ClassifyProgress) => void;
   /** Reviewer-requested second evaluation: adjudicate with the escalation model. */
   forceEscalation?: boolean;
   /** Evaluation mode: this model for all stages; nothing persisted; screening cache still used. */
@@ -211,7 +219,7 @@ export async function classifyEncounter(encounterId: string, opts: ClassifyOptio
   const [limits, retrieval, pipeline, highRiskTerms, prompt] = await Promise.all([
     getSetting("processingLimits"),
     getSetting("retrieval"),
-    getSetting("pipeline"),
+    effectivePipeline(),
     getSetting("highRiskTerms"),
     activePrompt(),
   ]);
@@ -245,7 +253,9 @@ export async function classifyEncounter(encounterId: string, opts: ClassifyOptio
   const scopeStart = dates.surgeryDate
     ? Date.UTC(dates.surgeryDate.getUTCFullYear(), dates.surgeryDate.getUTCMonth(), dates.surgeryDate.getUTCDate()) - 2 * DAY
     : null;
-  const inScope = uniqueNotes.filter((n) => !n.dateOfService || scopeStart === null || n.dateOfService.getTime() >= scopeStart);
+  const inScope = uniqueNotes
+    .filter((n) => !n.dateOfService || scopeStart === null || n.dateOfService.getTime() >= scopeStart)
+    .sort((a, b) => (a.dateOfService?.getTime() ?? 0) - (b.dateOfService?.getTime() ?? 0) || a.noteId.localeCompare(b.noteId));
 
   const lib = await prisma.exampleLibraryVersion.findFirst({ where: { active: true }, select: { version: true } });
   const cacheKey = sha256(
@@ -298,34 +308,50 @@ export async function classifyEncounter(encounterId: string, opts: ClassifyOptio
   };
   const ctx = { jobId: opts.jobId, encounterId, retryLimit: limits.retryLimit };
 
-  // ---- Stage A: screening -------------------------------------------------------------
-  const segments =
+  const timeLeft = () => (opts.deadline ? opts.deadline - Date.now() : Number.POSITIVE_INFINITY);
+  const progress = (p: ClassifyProgress) => opts.onProgress?.(p);
+
+  // ---- Stage A: screening (new text only, packed, parallel, cached per batch) -----------
+  const spans: Span[] =
     pipeline.screeningMode === "full"
-      ? inScope.flatMap((n) => noteSegments(n, pipeline.screenChunkChars))
+      ? novelSpans(inScope).spans
       : prepareEncounterPassages(inScope, retrieval).passages.map((p) => ({
           clinicalNoteId: p.clinicalNoteId,
-          text: p.text,
-          offset: p.start,
           noteType: p.noteType,
           date: p.dateOfService,
+          start: p.start,
+          end: p.end,
+          text: p.text,
         }));
-  const mentions: ScreenMention[] = [];
-  for (const seg of segments) {
-    await guard();
-    const r = await screenSegment(seg, catalogue, primary, cfg.primaryEffort, { ...ctx, purpose: "screening" });
-    addCost(cost, r.cost);
-    mentions.push(...r.mentions);
-  }
+  const batches = packBatches(spans, pipeline.screenChunkChars);
+  let screened = 0;
+  progress({ stage: "screening", done: 0, total: batches.length });
+  const batchMentions = await mapPool(
+    batches,
+    limits.concurrency,
+    async (batch) => {
+      await guard();
+      const r = await screenBatch(batch, catalogue, primary, cfg.primaryEffort, { ...ctx, purpose: "screening" });
+      addCost(cost, r.cost);
+      progress({ stage: "screening", done: ++screened, total: batches.length });
+      return r.mentions;
+    },
+    () => timeLeft() < 25_000,
+  );
+  if (batchMentions.some((m) => m === undefined)) throw new YieldError(`Time budget reached after screening ${screened}/${batches.length} batches`);
+  const mentions: ScreenMention[] = batchMentions.flat().filter((m): m is ScreenMention => Boolean(m));
   const flagged = [...new Set(mentions.filter((m) => m.assertion === "affirmed" || m.assertion === "possible").map((m) => m.code))];
+  if (flagged.length && timeLeft() < 40_000) throw new YieldError("Time budget reached before adjudication");
 
-  // ---- Stage B: per-code adjudication with consistency --------------------------------
-  const events: EncounterEvent[] = [];
+  // ---- Stage B: per-code adjudication (codes in parallel, consistency runs in parallel, each run cached) ----
   let escalated = false;
   const escalationReasons: string[] = [];
   let passagesSent = 0;
+  let adjudicated = 0;
   const timeline = timelineText(dates, dischargeDerived);
+  progress({ stage: "adjudication", done: 0, total: flagged.length });
 
-  for (const code of flagged) {
+  const adjudicateCode = async (code: string): Promise<EncounterEvent> => {
     const { rule, checklist } = checklists.get(code)!;
     const passages = buildPassages(
       mentions.filter((m) => m.code === code),
@@ -348,9 +374,20 @@ export async function classifyEncounter(encounterId: string, opts: ClassifyOptio
     });
     const window = computeWindow(checklist.timeframe, dates);
 
-    const runOnce = async (model: string, effort: string, purpose: string): Promise<RunResult> => {
+    const runOnce = async (model: string, effort: string, purpose: string, variant: string | number): Promise<RunResult> => {
       await guard();
-      const { output, cost: c } = await callStructured(model, effort, prompt.systemPrompt, user, adjudicationSchema, "code_adjudication", { ...ctx, purpose });
+      const { output, cost: c } = await cachedStructured(
+        `adj:${OUTPUT_SCHEMA_VERSION}`,
+        model,
+        effort,
+        prompt.systemPrompt,
+        user,
+        adjudicationSchema,
+        "code_adjudication",
+        { ...ctx, purpose },
+        // System prompt + this code's STS definition form a shared prefix across encounters.
+        { promptCacheKey: `sts-adj-${manual.id.slice(-8)}-${code}`, variant },
+      );
       addCost(cost, c);
       const { results, issues } = validateAdjudication(output, checklist, passages);
       const metEvidence = results.filter((r) => r.kind !== "exclusion" && r.effectiveStatus === "met").flatMap((r) => r.evidence);
@@ -368,12 +405,14 @@ export async function classifyEncounter(encounterId: string, opts: ClassifyOptio
       };
     };
 
-    const runs: RunResult[] = [];
     // High-risk codes (arrest, reoperation, ECMO…) always get at least two independent runs.
     const highRisk = highRiskTerms.some((t) => checklist.name.toLowerCase().includes(t.toLowerCase()));
     const n = opts.forceEscalation && !opts.evaluationModel ? 1 : Math.max(pipeline.consistencyRuns, highRisk ? 2 : 1);
-    for (let i = 0; i < n; i++)
-      runs.push(await runOnce(adjudicator, adjEffort, opts.evaluationModel ? "evaluation" : i === 0 ? "adjudication" : "adjudication-consistency"));
+    const runs = await Promise.all(
+      Array.from({ length: n }, (_, i) =>
+        runOnce(adjudicator, adjEffort, opts.evaluationModel ? "evaluation" : i === 0 ? "adjudication" : "adjudication-consistency", i),
+      ),
+    );
 
     let final = runs[0];
     let agreement = n === 1 ? (opts.forceEscalation ? "single run (reviewer-requested escalation model)" : "single run") : `${n}/${n} runs agree`;
@@ -383,7 +422,7 @@ export async function classifyEncounter(encounterId: string, opts: ClassifyOptio
       const stats = opts.escalationStats ?? { escalated: 0, processed: 0 };
       const rateOk = stats.processed === 0 || (stats.escalated + 1) / (stats.processed + 1) <= limits.maxEscalationRate;
       if (!opts.evaluationModel && cfg.escalation && cfg.escalation !== adjudicator && rateOk) {
-        final = await runOnce(cfg.escalation, cfg.escalationEffort, "adjudication-tiebreak");
+        final = await runOnce(cfg.escalation, cfg.escalationEffort, "adjudication-tiebreak", "tiebreak");
         escalated = true;
         escalationReasons.push(`code ${code}: runs disagreed (${split})`);
         agreement = `split (${split}); tie-break by ${cfg.escalation}: ${final.decision.outcome}`;
@@ -409,7 +448,8 @@ export async function classifyEncounter(encounterId: string, opts: ClassifyOptio
       .filter((r) => (final.decision.outcome === "negative" ? true : r.kind !== "exclusion") && r.effectiveStatus === "met")
       .flatMap((r) => r.evidence);
     const dedup = [...new Map(evidence.map((e) => [`${e.clinicalNoteId}|${e.start}`, e])).values()];
-    events.push({
+    progress({ stage: "adjudication", done: ++adjudicated, total: flagged.length, detail: `code ${code}` });
+    return {
       code,
       complication: checklist.name,
       stsCode: code,
@@ -427,8 +467,12 @@ export async function classifyEncounter(encounterId: string, opts: ClassifyOptio
       issues: final.issues,
       modelUsed: final.model,
       rule: { id: rule.id, pageNumber: rule.pageNumber, sectionName: rule.sectionName },
-    });
-  }
+    };
+  };
+
+  const adjudicatedEvents = await mapPool(flagged, Math.max(1, Math.ceil(limits.concurrency / 2)), adjudicateCode, () => timeLeft() < 30_000);
+  if (adjudicatedEvents.some((e) => e === undefined)) throw new YieldError(`Time budget reached after adjudicating ${adjudicated}/${flagged.length} codes`);
+  const events = adjudicatedEvents as EncounterEvent[];
 
   const modelUsed = escalated ? `${adjudicator} + ${cfg.escalation} (tie-break)` : adjudicator;
   let ids: string[] = [];
@@ -440,7 +484,15 @@ export async function classifyEncounter(encounterId: string, opts: ClassifyOptio
       cacheKey,
       jobId: opts.jobId,
     });
-    const payload = { modelUsed, escalated, notesScreened: inScope.length, passagesSent, codesFlagged: flagged.length, manualSelection: selection.selection };
+    const payload = {
+      modelUsed,
+      escalated,
+      notesScreened: inScope.length,
+      screeningBatches: batches.length,
+      passagesSent,
+      codesFlagged: flagged.length,
+      manualSelection: selection.selection,
+    };
     await prisma.classificationCache.upsert({
       where: { cacheKey },
       create: {

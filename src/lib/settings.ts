@@ -26,7 +26,16 @@ export const retrievalSchema = z.object({
 });
 
 /** Staged pipeline: full-coverage screening → per-code checklist adjudication → consistency. */
+export const PROFILES = {
+  /** Every note screened; every flagged code adjudicated twice (disagreement → escalation model + human review). */
+  audit: { screeningMode: "full", consistencyRuns: 2, screenChunkChars: 12000, maxPassagesPerCode: 12 },
+  /** Keyword-selected passages only; single adjudication run (high-risk codes still get two). Lower recall. */
+  economy: { screeningMode: "lexicon", consistencyRuns: 1, screenChunkChars: 12000, maxPassagesPerCode: 8 },
+} as const;
+
 export const pipelineSchema = z.object({
+  /** Preset chosen in Settings; "custom" uses the advanced fields below as stored. */
+  profile: z.enum(["audit", "economy", "custom"]).default("audit"),
   /** "full": screen every note in the STS window (audit-grade recall). "lexicon": screen keyword-selected passages only (cheaper). */
   screeningMode: z.enum(["full", "lexicon"]),
   /** Independent adjudication runs per flagged code; disagreement triggers the escalation model and human review. */
@@ -56,12 +65,12 @@ export type SettingKey = keyof typeof settingsSchemas;
 export type SettingValue<K extends SettingKey> = z.infer<(typeof settingsSchemas)[K]>;
 
 export const settingDefaults: { [K in SettingKey]: SettingValue<K> } = {
-  pipeline: { screeningMode: "full", consistencyRuns: 2, eventFieldSeqNos: ["4740"], screenChunkChars: 12000, maxPassagesPerCode: 12 },
+  pipeline: { profile: "audit", screeningMode: "full", consistencyRuns: 2, eventFieldSeqNos: ["4740"], screenChunkChars: 12000, maxPassagesPerCode: 12 },
   processingLimits: {
     maxJobTokenBudget: 20_000_000,
     maxEncounterCostUsd: 10,
     maxEscalationRate: 0.25,
-    concurrency: 2,
+    concurrency: 8,
     retryLimit: 3,
     dailyCostLimitUsd: 50,
   },
@@ -93,4 +102,10 @@ export async function setSetting<K extends SettingKey>(key: K, value: unknown, u
 export async function getAllSettings() {
   const entries = await Promise.all((Object.keys(settingsSchemas) as SettingKey[]).map(async (k) => [k, await getSetting(k)] as const));
   return Object.fromEntries(entries) as { [K in SettingKey]: SettingValue<K> };
+}
+
+/** Pipeline settings with the selected profile applied. */
+export async function effectivePipeline() {
+  const p = await getSetting("pipeline");
+  return p.profile === "custom" ? p : { ...p, ...PROFILES[p.profile] };
 }
