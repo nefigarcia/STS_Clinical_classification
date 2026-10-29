@@ -307,6 +307,24 @@ Do not use live PHI in GitHub, Copilot prompts, or any unapproved tool.
 
 ---
 
+## Signing in without Microsoft Entra ID
+
+If Entra ID is not configured, users sign in with an **email and password**.
+- **Accounts:** administrators create accounts in **Settings → Users and roles**. Each person gets their own account, so the audit trail is per person.
+- **First administrator:** bootstrap one per environment:
+  ```bash
+  npm run create-admin -- you@childrensnebraska.org "Your Name"   # prints a one-time temporary password
+  ```
+- **Temporary passwords:** new accounts and admin resets issue a one-time temporary password (shown once). The user must change it at first sign-in; until then every page and API refuses them.
+- **Password policy:** at least 12 characters, three character classes, no common words or email name.
+- **Storage:** passwords are stored only as scrypt hashes with a per-user salt.
+- **Lockout:** 5 failed attempts lock the account for 15 minutes; an administrator can unlock it.
+- **Session invalidation:** changing or resetting a password signs that user out everywhere.
+- **Audit:** sign-ins, failures, lockouts, resets and changes are all logged.
+- **Entra later:** if Entra ID is configured, both methods work. Set `AUTH_PASSWORD_LOGIN_ENABLED=false` for SSO only.
+
+Confirm with Children's Nebraska security whether multi-factor authentication is required for PHI systems; if so, this is an interim measure.
+
 ## Deploying to Vercel
 
 1. Provision an **approved** PostgreSQL with `vector` and `pg_trgm` available, then run `npm run db:migrate` against it from CI or a trusted machine.

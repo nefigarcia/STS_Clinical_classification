@@ -1,18 +1,20 @@
 import { redirect } from "next/navigation";
-import { LogOut, ShieldAlert } from "lucide-react";
+import Link from "next/link";
+import { KeyRound, LogOut, ShieldAlert } from "lucide-react";
 import { currentUser } from "@/lib/auth/guard";
 import { signOut } from "@/lib/auth/auth";
 import { systemStatus } from "@/lib/security/gates";
 import { ROLE_LABEL } from "@/lib/auth/roles";
-import { devLoginAllowed } from "@/lib/env";
+import { devLoginAllowed, env } from "@/lib/env";
 import { AppSidebar } from "@/components/layout/app-sidebar";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 
 export const dynamic = "force-dynamic";
 
 export default async function DashboardLayout({ children }: LayoutProps<"/">) {
   const user = await currentUser();
   if (!user) redirect("/sign-in");
+  if (user.mustChangePassword) redirect("/change-password");
   const status = await systemStatus();
   const warnings: string[] = [];
   if (!status.approvedManual) warnings.push("STS-based classification unavailable: no approved STS CHSD Training Manual is loaded.");
@@ -27,7 +29,7 @@ export default async function DashboardLayout({ children }: LayoutProps<"/">) {
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="sticky top-0 z-20 flex h-14 items-center justify-between gap-4 border-b bg-white/90 px-4 backdrop-blur lg:px-6">
           <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-            {devLoginAllowed() && <span className="rounded bg-amber-100 px-2 py-0.5 font-medium text-amber-900">DEV LOGIN · synthetic data only</span>}
+            {devLoginAllowed() && <span className="rounded bg-amber-100 px-2 py-0.5 font-medium text-amber-900">{env().AUTH_DEV_LOGIN_UNSAFE_OVERRIDE ? "PILOT: password-less login enabled" : "DEV LOGIN · synthetic data only"}</span>}
             <span className="hidden sm:inline">Environment: {status.appEnv}</span>
           </div>
           <div className="flex items-center gap-3">
@@ -35,6 +37,11 @@ export default async function DashboardLayout({ children }: LayoutProps<"/">) {
               <div className="text-sm font-medium">{user.name ?? user.email}</div>
               <div className="text-[11px] text-muted-foreground">{ROLE_LABEL[user.role]}</div>
             </div>
+            {user.passwordHash && (
+              <Link href="/change-password" className={buttonVariants({ variant: "ghost", size: "icon" })} aria-label="Change password" title="Change password">
+                <KeyRound aria-hidden />
+              </Link>
+            )}
             <form
               action={async () => {
                 "use server";

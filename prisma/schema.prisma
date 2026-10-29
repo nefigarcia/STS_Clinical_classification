@@ -147,6 +147,13 @@ model User {
   createdAt   DateTime  @default(now())
   lastLoginAt DateTime?
 
+  /// Local password login (scrypt hash; never the password itself). Null for SSO-only users.
+  passwordHash       String?
+  mustChangePassword Boolean   @default(false)
+  passwordChangedAt  DateTime?
+  failedLoginCount   Int       @default(0)
+  lockedUntil        DateTime?
+
   reviews        ReviewDecision[]
   auditLogs      AuditLog[]
   uploadedFiles  SourceFile[]

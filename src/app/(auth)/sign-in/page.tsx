@@ -3,7 +3,9 @@ import { log } from "@/lib/security/logger";
 import { HeartPulse, ShieldAlert, LogIn } from "lucide-react";
 import { signIn } from "@/lib/auth/auth";
 import { currentUser } from "@/lib/auth/guard";
-import { devLoginAllowed, entraConfigured } from "@/lib/env";
+import { devLoginAllowed, entraConfigured, passwordLoginEnabled } from "@/lib/env";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
@@ -31,6 +33,9 @@ export default async function SignInPage({ searchParams }: PageProps<"/sign-in">
   if (await currentUser()) redirect(callbackUrl);
   const entra = entraConfigured();
   const dev = devLoginAllowed();
+  const password = passwordLoginEnabled();
+  const credentialsError = sp.error === "credentials";
+  const notice = Array.isArray(sp.notice) ? sp.notice[0] : sp.notice;
 
   return (
     <main className="flex min-h-screen items-center justify-center p-6">
@@ -43,11 +48,51 @@ export default async function SignInPage({ searchParams }: PageProps<"/sign-in">
           <CardDescription>Children&apos;s Nebraska · Clinical abstraction platform</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {sp.error && (
+          {notice === "password-changed" && (
+            <p role="status" className="rounded-md bg-emerald-50 p-3 text-sm text-emerald-800">
+              Password changed. Please sign in with your new password.
+            </p>
+          )}
+          {credentialsError && (
+            <p role="alert" className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">
+              Invalid email or password, or the account is locked or disabled. After 5 failed attempts an account is locked for 15 minutes; an administrator can
+              unlock it.
+            </p>
+          )}
+          {sp.error && !credentialsError && (
             <p role="alert" className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">
               Sign-in failed ({String(sp.error)}). Your account may not be authorized, or the server could not complete sign-in.
             </p>
           )}
+          {password && (
+            <form
+              className="space-y-3"
+              action={async (fd: FormData) => {
+                "use server";
+                try {
+                  await signIn("password", { email: String(fd.get("email") ?? ""), password: String(fd.get("password") ?? ""), redirectTo: callbackUrl });
+                } catch (err) {
+                  unstable_rethrow(err); // success is a redirect
+                  const type = (err as { type?: string } | null)?.type;
+                  redirect(`/sign-in?error=${type === "CredentialsSignin" ? "credentials" : encodeURIComponent(authErrorType(err))}`);
+                }
+              }}
+            >
+              <div className="space-y-1.5">
+                <Label htmlFor="email">Work email</Label>
+                <Input id="email" name="email" type="email" autoComplete="username" required />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="password">Password</Label>
+                <Input id="password" name="password" type="password" autoComplete="current-password" required />
+              </div>
+              <Button type="submit" className="w-full" size="lg">
+                <LogIn aria-hidden /> Sign in
+              </Button>
+              <p className="text-center text-xs text-muted-foreground">Forgot your password? Ask an administrator to reset it.</p>
+            </form>
+          )}
+          {password && entra && <div className="text-center text-xs text-muted-foreground">or</div>}
           {entra && (
             <form
               action={async () => {
@@ -60,7 +105,7 @@ export default async function SignInPage({ searchParams }: PageProps<"/sign-in">
               </Button>
             </form>
           )}
-          {!entra && !dev && (
+          {!entra && !dev && !password && (
             <p className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
               Microsoft Entra ID is not configured. Set AUTH_MICROSOFT_ENTRA_ID_ID, _SECRET and _ISSUER, or enable AUTH_DEV_LOGIN_ENABLED for local
               synthetic-data development.

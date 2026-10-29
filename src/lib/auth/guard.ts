@@ -24,6 +24,8 @@ export async function currentUser(): Promise<User | null> {
 export async function requireRole(required: Role): Promise<User> {
   const user = await currentUser();
   if (!user) throw new ApiError(401, "Authentication required");
+  // A temporary (admin-issued) password only allows changing it.
+  if (user.mustChangePassword) throw new ApiError(403, "Password change required before using the application");
   if (!hasRole(user.role, required)) throw new ApiError(403, `Requires ${required} role`);
   return user;
 }
@@ -32,6 +34,7 @@ export async function requireRole(required: Role): Promise<User> {
 export async function requirePageRole(required: Role): Promise<User> {
   const user = await currentUser();
   if (!user) redirect("/sign-in");
+  if (user.mustChangePassword) redirect("/change-password");
   if (!hasRole(user.role, required)) redirect("/dashboard?forbidden=1");
   return user;
 }

@@ -3,7 +3,8 @@ import MicrosoftEntraID from "next-auth/providers/microsoft-entra-id";
 import Credentials from "next-auth/providers/credentials";
 import type { Role } from "@prisma/client";
 import { prisma } from "@/lib/db/prisma";
-import { env, entraConfigured, devLoginAllowed } from "@/lib/env";
+import { env, entraConfigured, devLoginAllowed, passwordLoginEnabled } from "@/lib/env";
+import { verifyPasswordLogin } from "@/lib/auth/password";
 import { mapEntraRoles } from "@/lib/auth/roles";
 import { audit } from "@/lib/audit";
 import { log } from "@/lib/security/logger";
@@ -32,6 +33,22 @@ function buildProviders(): NextAuthConfig["providers"] {
         clientId: env().AUTH_MICROSOFT_ENTRA_ID_ID,
         clientSecret: env().AUTH_MICROSOFT_ENTRA_ID_SECRET,
         issuer: env().AUTH_MICROSOFT_ENTRA_ID_ISSUER,
+      }),
+    );
+  }
+  if (passwordLoginEnabled()) {
+    providers.push(
+      Credentials({
+        id: "password",
+        name: "Email and password",
+        credentials: { email: { label: "Email", type: "email" }, password: { label: "Password", type: "password" } },
+        async authorize(creds) {
+          const email = String(creds?.email ?? "").slice(0, 320);
+          const password = String(creds?.password ?? "").slice(0, 1024);
+          if (!email || !password) return null;
+          const r = await verifyPasswordLogin(email, password);
+          return r.ok ? { id: r.user.id, email: r.user.email, name: r.user.name } : null;
+        },
       }),
     );
   }
@@ -95,6 +112,11 @@ export const authConfig: NextAuthConfig = {
         });
         token.uid = dbUser.id;
         await audit({ userId: dbUser.id, action: "auth.sign_in", entityType: "User", entityId: dbUser.id, metadata: { provider: "entra", role } });
+      } else if (account?.provider === "password" && user?.id) {
+        // Remember when the password was set; a later change/reset invalidates this session.
+        const u = await prisma.user.findUnique({ where: { id: user.id }, select: { passwordChangedAt: true } });
+        token.uid = user.id;
+        token.pwdAt = u?.passwordChangedAt?.getTime() ?? 0;
       } else if (account?.provider === "dev-login" && user?.id) {
         token.uid = user.id;
         await audit({ userId: user.id, action: "auth.sign_in", entityType: "User", entityId: user.id, metadata: { provider: "dev-login" } });
@@ -104,10 +126,12 @@ export const authConfig: NextAuthConfig = {
     async session({ session, token }) {
       const uid = typeof token.uid === "string" ? token.uid : null;
       const dbUser = uid ? await prisma.user.findUnique({ where: { id: uid } }) : null;
-      if (dbUser && dbUser.active) {
+      const pwdAt = typeof token.pwdAt === "number" ? token.pwdAt : null;
+      const passwordRotated = pwdAt !== null && (dbUser?.passwordChangedAt?.getTime() ?? 0) > pwdAt;
+      if (dbUser && dbUser.active && !passwordRotated) {
         session.user = { id: dbUser.id, email: dbUser.email, name: dbUser.name, role: dbUser.role } as typeof session.user;
       } else {
-        // Deactivated or unknown users get no identity.
+        // Deactivated/unknown users, or sessions older than a password change/reset, get no identity.
         session.user = undefined as unknown as typeof session.user;
       }
       return session;

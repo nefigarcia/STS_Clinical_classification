@@ -12,6 +12,13 @@ const schema = z.object({
   REFERENCE_DATA_DIR: z.string().default("./reference-data"),
   MAX_UPLOAD_MB: z.coerce.number().positive().default(100),
   AUTH_DEV_LOGIN_ENABLED: bool,
+  /** Explicit opt-in to the password-less role picker in production / with PHI (pilot use only). */
+  AUTH_DEV_LOGIN_UNSAFE_OVERRIDE: bool,
+  /** Email + password accounts managed by administrators (default on; set "false" to allow SSO only). */
+  AUTH_PASSWORD_LOGIN_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => (v ?? "true").trim().toLowerCase() !== "false"),
   AUTH_MICROSOFT_ENTRA_ID_ID: z.string().optional(),
   AUTH_MICROSOFT_ENTRA_ID_SECRET: z.string().optional(),
   AUTH_MICROSOFT_ENTRA_ID_ISSUER: z.string().optional(),
@@ -59,5 +66,10 @@ export function entraConfigured(): boolean {
 /** Dev login is refused in production and whenever PHI processing has been approved. */
 export function devLoginAllowed(): boolean {
   const e = env();
-  return e.AUTH_DEV_LOGIN_ENABLED && e.APP_ENV !== "production" && !e.PHI_EXTERNAL_AI_APPROVED;
+  if (!e.AUTH_DEV_LOGIN_ENABLED) return false;
+  return e.AUTH_DEV_LOGIN_UNSAFE_OVERRIDE || (e.APP_ENV !== "production" && !e.PHI_EXTERNAL_AI_APPROVED);
+}
+
+export function passwordLoginEnabled(): boolean {
+  return env().AUTH_PASSWORD_LOGIN_ENABLED;
 }

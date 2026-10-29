@@ -24,7 +24,8 @@
     "seed:synthetic": "tsx scripts/seed-synthetic-data.ts",
     "validate:historical": "tsx scripts/validate-historical-examples.ts",
     "load:manual": "tsx scripts/load-sts-manual.ts",
-    "reset:classifications": "tsx scripts/reset-classifications.ts"
+    "reset:classifications": "tsx scripts/reset-classifications.ts",
+    "create-admin": "tsx scripts/create-admin.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",

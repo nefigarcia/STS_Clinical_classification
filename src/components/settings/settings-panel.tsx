@@ -456,66 +456,174 @@ function TermsForm({ value, disabled, onSave }: { value: string[]; disabled: boo
   );
 }
 
-type U = { id: string; email: string; name: string | null; role: string; active: boolean; lastLoginAt: string | null };
-function UsersCard() {
-  const [users, setUsers] = useState<U[]>([]);
-  const load = useCallback(
-    () =>
-      api<{ users: U[] }>("/api/admin/users")
-        .then((r) => setUsers(r.users))
-        .catch((e) => toast.error(e.message)),
-    [],
+type U = {
+  id: string;
+  email: string;
+  name: string | null;
+  role: string;
+  active: boolean;
+  lastLoginAt: string | null;
+  hasPassword: boolean;
+  sso: boolean;
+  mustChangePassword: boolean;
+  locked: boolean;
+};
+
+/** One-time display of an admin-issued temporary password. */
+function TempPasswordNotice({ email, password, onClose }: { email: string; password: string; onClose: () => void }) {
+  return (
+    <div role="status" className="space-y-2 rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-sm">
+      <p>
+        Temporary password for <span className="font-medium">{email}</span>. It is shown <strong>only once</strong>. Give it to the user through a secure
+        channel; they must change it at first sign-in.
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <code className="rounded bg-white px-2 py-1 font-mono text-base ring-1 ring-emerald-300">{password}</code>
+        <Button size="sm" variant="outline" onClick={() => navigator.clipboard.writeText(password).then(() => toast.success("Copied"))}>
+          Copy
+        </Button>
+        <Button size="sm" variant="ghost" onClick={onClose}>
+          Done
+        </Button>
+      </div>
+    </div>
   );
-  useEffect(() => {
-    load();
-  }, [load]);
+}
+
+function UsersCard() {
+  const { data, reload } = useApi<{ users: U[] }>("/api/admin/users");
+  const users = data?.users ?? [];
+  const [issued, setIssued] = useState<{ email: string; password: string } | null>(null);
+  const [form, setForm] = useState({ email: "", name: "", role: "REVIEWER" });
+  const [busy, setBusy] = useState(false);
+
   const patch = (id: string, body: object) =>
-    api("/api/admin/users", { method: "PATCH", json: { id, ...body } })
-      .then(() => (toast.success("User updated"), load()))
-      .catch((e) => toast.error(e.message));
+    api<{ temporaryPassword?: string }>("/api/admin/users", { method: "PATCH", json: { id, ...body } })
+      .then((r) => {
+        reload();
+        return r;
+      })
+      .catch((e) => {
+        toast.error(e.message);
+        return null;
+      });
+
+  async function create(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      const r = await api<{ email: string; temporaryPassword: string }>("/api/admin/users", {
+        method: "POST",
+        json: { email: form.email, name: form.name || null, role: form.role },
+      });
+      setIssued({ email: r.email, password: r.temporaryPassword });
+      setForm({ email: "", name: "", role: "REVIEWER" });
+      reload();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reset(u: U) {
+    if (!window.confirm(`Reset the password for ${u.email}? They will be signed out everywhere and must use the new temporary password.`)) return;
+    const r = await patch(u.id, { action: "reset_password" });
+    if (r?.temporaryPassword) setIssued({ email: u.email, password: r.temporaryPassword });
+  }
+
   return (
     <Card>
       <CardHeader>
         <CardTitle>Users and roles</CardTitle>
-        <CardDescription>Roles from Entra app-role claims override these on each sign-in. Every server endpoint checks the role.</CardDescription>
+        <CardDescription>
+          Each person has their own account so every action is audited to them. New accounts get a one-time temporary password that must be changed at first
+          sign-in. 5 failed sign-ins lock an account for 15 minutes. If Microsoft Entra ID is configured later, Entra roles override these on each sign-in.
+        </CardDescription>
       </CardHeader>
-      <CardContent className="overflow-x-auto p-0">
-        <table className="w-full text-sm">
-          <thead className="bg-slate-50 text-left">
-            <tr>
-              <th className="px-3 py-2">User</th>
-              <th>Role</th>
-              <th>Active</th>
-              <th>Last sign-in</th>
-            </tr>
-          </thead>
-          <tbody>
-            {users.map((u) => (
-              <tr key={u.id} className="border-t">
-                <td className="px-3 py-1.5">
-                  {u.name ?? u.email}
-                  <div className="text-xs text-muted-foreground">{u.email}</div>
-                </td>
-                <td>
-                  <select
-                    aria-label={`Role for ${u.email}`}
-                    className={NativeSelectClass}
-                    value={u.role}
-                    onChange={(e) => patch(u.id, { role: e.target.value })}
-                  >
-                    <option value="ADMIN">Administrator</option>
-                    <option value="REVIEWER">Clinical Reviewer</option>
-                    <option value="READ_ONLY">Read-Only User</option>
-                  </select>
-                </td>
-                <td>
-                  <input type="checkbox" aria-label={`Active ${u.email}`} checked={u.active} onChange={(e) => patch(u.id, { active: e.target.checked })} />
-                </td>
-                <td className="text-xs">{formatDate(u.lastLoginAt, true)}</td>
+      <CardContent className="space-y-4">
+        {issued && <TempPasswordNotice email={issued.email} password={issued.password} onClose={() => setIssued(null)} />}
+        <form onSubmit={create} className="grid gap-2 rounded-lg border p-3 sm:grid-cols-[1fr_1fr_auto_auto]">
+          <Input
+            type="email"
+            required
+            placeholder="work email"
+            aria-label="New user email"
+            value={form.email}
+            onChange={(e) => setForm({ ...form, email: e.target.value })}
+          />
+          <Input placeholder="name (optional)" aria-label="New user name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+          <select aria-label="New user role" className={NativeSelectClass} value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>
+            <option value="REVIEWER">Clinical Reviewer</option>
+            <option value="READ_ONLY">Read-Only User</option>
+            <option value="ADMIN">Administrator</option>
+          </select>
+          <Button type="submit" disabled={busy}>
+            {busy && <Loader2 className="animate-spin" aria-hidden />} Add user
+          </Button>
+        </form>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-left">
+              <tr>
+                <th className="px-3 py-2">User</th>
+                <th>Role</th>
+                <th>Active</th>
+                <th>Sign-in</th>
+                <th>Last sign-in</th>
+                <th className="px-3">Actions</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {users.map((u) => (
+                <tr key={u.id} className="border-t align-middle">
+                  <td className="px-3 py-1.5">
+                    {u.name ?? u.email}
+                    <div className="text-xs text-muted-foreground">{u.email}</div>
+                  </td>
+                  <td>
+                    <select
+                      aria-label={`Role for ${u.email}`}
+                      className={NativeSelectClass}
+                      value={u.role}
+                      onChange={(e) => patch(u.id, { role: e.target.value })}
+                    >
+                      <option value="ADMIN">Administrator</option>
+                      <option value="REVIEWER">Clinical Reviewer</option>
+                      <option value="READ_ONLY">Read-Only User</option>
+                    </select>
+                  </td>
+                  <td>
+                    <input type="checkbox" aria-label={`Active ${u.email}`} checked={u.active} onChange={(e) => patch(u.id, { active: e.target.checked })} />
+                  </td>
+                  <td className="text-xs">
+                    <span className="flex flex-wrap gap-1">
+                      {u.hasPassword && <span className="rounded bg-slate-100 px-1.5">password</span>}
+                      {u.sso && <span className="rounded bg-slate-100 px-1.5">Microsoft</span>}
+                      {u.mustChangePassword && <span className="rounded bg-amber-100 px-1.5 text-amber-900">temporary password</span>}
+                      {u.locked && <span className="rounded bg-rose-100 px-1.5 text-rose-800">locked</span>}
+                    </span>
+                  </td>
+                  <td className="text-xs">{formatDate(u.lastLoginAt, true)}</td>
+                  <td className="px-3">
+                    <span className="flex gap-1">
+                      {u.hasPassword && (
+                        <Button size="xs" variant="outline" onClick={() => reset(u)}>
+                          Reset password
+                        </Button>
+                      )}
+                      {u.locked && (
+                        <Button size="xs" variant="outline" onClick={() => patch(u.id, { action: "unlock" }).then(() => toast.success("Unlocked"))}>
+                          Unlock
+                        </Button>
+                      )}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </CardContent>
     </Card>
   );
