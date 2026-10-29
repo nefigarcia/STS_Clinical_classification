@@ -41,7 +41,20 @@ async function main() {
   const buf = fs.readFileSync(file);
   const hash = sha256(buf);
 
-  const existing = await prisma.manualVersion.findFirst({ where: { sha256: hash, status: { notIn: ["FAILED", "REJECTED"] } } });
+  // Prefer a version that already finished indexing; otherwise finish one that got stuck (e.g. uploaded via the UI but never indexed).
+  const existing =
+    (await prisma.manualVersion.findFirst({ where: { sha256: hash, status: { in: ["INDEXED", "APPROVED"] } } })) ??
+    (await prisma.manualVersion.findFirst({ where: { sha256: hash, status: { in: ["UPLOADED", "INDEXING", "FAILED"] } }, orderBy: { createdAt: "desc" } }));
+  if (existing && !["INDEXED", "APPROVED"].includes(existing.status)) {
+    console.log(`Found version ${existing.version} stuck at ${existing.status}; indexing it now…`);
+    const r = await parseAndStoreManual(existing.id);
+    console.log(`Pages: ${r.pageCount}. Rules extracted: ${r.rules}.`);
+    if (r.toEmbed > 0) for (let n = await embedRuleBatch(existing.id, null); n > 0; n = await embedRuleBatch(existing.id, null)) process.stdout.write(".");
+    await finishIndexing(existing.id);
+    console.log(await manualStats(existing.id));
+    if (has("approve")) await approve(existing.id);
+    return;
+  }
   if (existing) {
     console.log(`Already loaded as version ${existing.version} (${existing.status}).`);
     console.log(await manualStats(existing.id));
