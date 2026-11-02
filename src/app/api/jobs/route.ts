@@ -3,14 +3,20 @@ import { z } from "zod";
 import { prisma } from "@/lib/db/prisma";
 import { handle, requireRole, ApiError } from "@/lib/auth/guard";
 import { parseJson } from "@/lib/api";
-import { createJob, triggerProcessing } from "@/lib/jobs/runner";
+import { createJob, hasIdleRunnableJob, kickProcessing } from "@/lib/jobs/runner";
 import { classificationGate, encounterClassification, mostRestrictive } from "@/lib/security/gates";
 import { modelConfig } from "@/lib/ai/openai-client";
 import { audit } from "@/lib/audit";
 
+/** Background work started in after() runs inside this invocation's time budget. */
+export const maxDuration = 300;
+
 export async function GET() {
   return handle("GET /api/jobs", async () => {
     await requireRole("READ_ONLY");
+    // Self-healing: if queued/interrupted work has nobody processing it (lease free), continue it here.
+    // The job lease guarantees this never runs work twice.
+    if (await hasIdleRunnableJob()) after(() => kickProcessing());
     const jobs = await prisma.processingJob.findMany({
       orderBy: { createdAt: "desc" },
       take: 50,
@@ -85,7 +91,7 @@ export async function POST(req: Request) {
       entityId: job.id,
       metadata: { type: "CLASSIFICATION", encounters: encounterIds.length },
     });
-    after(() => triggerProcessing(job.id));
+    after(() => kickProcessing(job.id));
     return { jobId: job.id, encounters: encounterIds.length };
   });
 }

@@ -3,9 +3,12 @@ import { z } from "zod";
 import { prisma } from "@/lib/db/prisma";
 import { handle, requireRole, ApiError } from "@/lib/auth/guard";
 import { parseJson } from "@/lib/api";
-import { createJob, triggerProcessing } from "@/lib/jobs/runner";
+import { createJob, kickProcessing } from "@/lib/jobs/runner";
 import { manualStats } from "@/lib/sts/manual-indexer";
 import { audit } from "@/lib/audit";
+
+/** Background work started in after() runs inside this invocation's time budget. */
+export const maxDuration = 300;
 
 export async function GET() {
   return handle("GET /api/knowledge-base/manuals", async () => {
@@ -66,7 +69,7 @@ export async function POST(req: Request) {
       entityId: mv.id,
       metadata: { version: body.version, jobId: job.id },
     });
-    after(() => triggerProcessing(job.id));
+    after(() => kickProcessing(job.id));
     return { manualVersionId: mv.id, jobId: job.id };
   });
 }

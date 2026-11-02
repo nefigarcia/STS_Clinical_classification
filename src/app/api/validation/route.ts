@@ -5,10 +5,13 @@ import { handle, requireRole, ApiError } from "@/lib/auth/guard";
 import { parseJson, searchParams } from "@/lib/api";
 import { historicalComparison } from "@/lib/validation/historical-comparison";
 import { assignCohortsByPatient, reviewExample } from "@/lib/review/example-library";
-import { createJob, triggerProcessing } from "@/lib/jobs/runner";
+import { createJob, kickProcessing } from "@/lib/jobs/runner";
 import { classificationGate, encounterClassification, mostRestrictive } from "@/lib/security/gates";
 import { modelConfig } from "@/lib/ai/openai-client";
 import { audit } from "@/lib/audit";
+
+/** Background work started in after() runs inside this invocation's time budget. */
+export const maxDuration = 300;
 
 const COHORTS = ["DEVELOPMENT", "HOLDOUT", "INDEPENDENT_TEST"] as const;
 
@@ -68,7 +71,7 @@ export async function POST(req: Request) {
       const pending = await prisma.historicalExample.findMany({ where: { quality: { not: "VERIFIED" }, source: "HISTORICAL_IMPORT" }, select: { id: true } });
       if (!pending.length) throw new ApiError(400, "No historical examples awaiting evidence mapping");
       const job = await createJob({ type: "HISTORICAL_PREP", createdById: user.id, items: pending.map((p) => ({ refId: p.id })) });
-      after(() => triggerProcessing(job.id));
+      after(() => kickProcessing(job.id));
       return { jobId: job.id };
     }
     if (body.action === "review_example") {
@@ -119,7 +122,7 @@ export async function POST(req: Request) {
       entityId: run.id,
       metadata: { model, cohort: body.cohort, encounters: encounterIds.length },
     });
-    after(() => triggerProcessing(job.id));
+    after(() => kickProcessing(job.id));
     return { evaluationRunId: run.id, jobId: job.id };
   });
 }

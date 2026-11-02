@@ -3,8 +3,11 @@ import { z } from "zod";
 import { prisma } from "@/lib/db/prisma";
 import { handle, requireRole, ApiError } from "@/lib/auth/guard";
 import { parseJson } from "@/lib/api";
-import { createJob, triggerProcessing } from "@/lib/jobs/runner";
+import { createJob, kickProcessing } from "@/lib/jobs/runner";
 import { audit } from "@/lib/audit";
+
+/** Background work started in after() runs inside this invocation's time budget. */
+export const maxDuration = 300;
 
 const schema = z.object({
   action: z.enum(["approve", "retire", "set_default", "reindex", "update_dates"]),
@@ -75,7 +78,7 @@ export async function PATCH(req: NextRequest, ctx: RouteContext<"/api/knowledge-
           fileName: mv.fileName,
           items: [{ refId: "parse" }],
         });
-        after(() => triggerProcessing(job.id));
+        after(() => kickProcessing(job.id));
         break;
       }
     }

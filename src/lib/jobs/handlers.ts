@@ -70,6 +70,12 @@ const classification: Handler = async (job, item, ctx) => {
 const manualIndexing: Handler = async (job, item) => {
   const manualVersionId = job.manualVersionId!;
   if (item.refId === "parse") {
+    // Never re-parse a manual that is already indexed/approved (e.g. loaded via `npm run load:manual`
+    // while this job sat queued) — that would delete its rules and its approval.
+    const current = await prisma.manualVersion.findUnique({ where: { id: manualVersionId }, select: { status: true } });
+    if (current && (current.status === "INDEXED" || current.status === "APPROVED")) {
+      return { status: "SKIPPED", error: `Manual already ${current.status.toLowerCase()}; nothing to do` };
+    }
     try {
       const r = await parseAndStoreManual(manualVersionId);
       await prisma.processingJob.update({ where: { id: job.id }, data: { result: r as unknown as Prisma.InputJsonValue } });

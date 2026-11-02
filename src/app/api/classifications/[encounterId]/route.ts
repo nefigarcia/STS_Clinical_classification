@@ -3,9 +3,12 @@ import { z } from "zod";
 import { prisma } from "@/lib/db/prisma";
 import { handle, requireRole, ApiError } from "@/lib/auth/guard";
 import { parseJson } from "@/lib/api";
-import { createJob, triggerProcessing } from "@/lib/jobs/runner";
+import { createJob, kickProcessing } from "@/lib/jobs/runner";
 import { classificationGate, encounterClassification } from "@/lib/security/gates";
 import { audit } from "@/lib/audit";
+
+/** Background work started in after() runs inside this invocation's time budget. */
+export const maxDuration = 300;
 
 const schema = z.object({ secondOpinion: z.boolean().default(false) });
 
@@ -32,7 +35,7 @@ export async function POST(req: NextRequest, ctx: RouteContext<"/api/classificat
       entityId: encounterId,
       metadata: { jobId: job.id },
     });
-    after(() => triggerProcessing(job.id));
+    after(() => kickProcessing(job.id));
     return { jobId: job.id };
   });
 }

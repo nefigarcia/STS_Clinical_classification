@@ -181,9 +181,36 @@ export async function processRunnableJobs(budgetMs: number, onlyJobId?: string):
   return { results, workRemains };
 }
 
+/**
+ * Public base URL for self-calls. The custom/production domain comes first: Vercel's per-deployment
+ * URL (VERCEL_URL) is usually behind Deployment Protection and would reject the call.
+ */
 function baseUrl(): string | null {
+  if (process.env.AUTH_URL) return process.env.AUTH_URL.replace(/\/$/, "");
+  if (process.env.VERCEL_PROJECT_PRODUCTION_URL) return `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`;
   if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
-  return process.env.AUTH_URL ?? null;
+  return null;
+}
+
+/**
+ * Process queued work directly in THIS invocation (call inside after()), then hand off to a fresh
+ * invocation only if work remains. Starting work no longer depends on a self-HTTP call.
+ */
+export async function kickProcessing(jobId?: string, budgetMs = 240_000) {
+  try {
+    const { results, workRemains } = await processRunnableJobs(budgetMs, jobId);
+    if (workRemains && results.some((r) => r.processed > 0)) await triggerProcessing();
+  } catch (err) {
+    log.error("job kick failed", err);
+  }
+}
+
+/** True when some queued/running job has no live lease (nobody is working on it). */
+export async function hasIdleRunnableJob(): Promise<boolean> {
+  const n = await prisma.processingJob.count({
+    where: { processingStatus: { in: ["QUEUED", "RUNNING"] }, OR: [{ lockedUntil: null }, { lockedUntil: { lt: new Date() } }] },
+  });
+  return n > 0;
 }
 
 /**

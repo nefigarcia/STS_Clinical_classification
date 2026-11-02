@@ -3,8 +3,11 @@ import { z } from "zod";
 import { prisma } from "@/lib/db/prisma";
 import { handle, requireRole, ApiError } from "@/lib/auth/guard";
 import { parseJson } from "@/lib/api";
-import { triggerProcessing } from "@/lib/jobs/runner";
+import { kickProcessing } from "@/lib/jobs/runner";
 import { audit } from "@/lib/audit";
+
+/** Background work started in after() runs inside this invocation's time budget. */
+export const maxDuration = 300;
 
 export async function GET(_req: NextRequest, ctx: RouteContext<"/api/jobs/[id]">) {
   return handle("GET /api/jobs/[id]", async () => {
@@ -54,7 +57,7 @@ export async function PATCH(req: NextRequest, ctx: RouteContext<"/api/jobs/[id]"
       }
       await prisma.jobItem.updateMany({ where: { jobId: id, status: "RUNNING" }, data: { status: "PENDING" } });
       await prisma.processingJob.update({ where: { id }, data: { processingStatus: "QUEUED", completedAt: null, lockedUntil: null, lockOwner: null } });
-      after(() => triggerProcessing(id));
+      after(() => kickProcessing(id));
     }
     await audit({ userId: user.id, action: `job.${action}`, entityType: "ProcessingJob", entityId: id });
     return { ok: true };

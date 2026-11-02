@@ -8,7 +8,7 @@ import { parseJson } from "@/lib/api";
 import { previewUpload } from "@/lib/data/preview";
 import { importClinicalNotes, importHistorical, loadTable, validateTable } from "@/lib/data/import-service";
 import { mappingSchema } from "@/lib/data/column-mapping";
-import { createJob, triggerProcessing } from "@/lib/jobs/runner";
+import { createJob, kickProcessing } from "@/lib/jobs/runner";
 import { audit } from "@/lib/audit";
 
 export const maxDuration = 300;
@@ -79,7 +79,7 @@ export async function POST(req: NextRequest, ctx: RouteContext<"/api/upload/[id]
         items: pending.map((p) => ({ refId: p.id })),
       });
       prepJobId = job.id;
-      after(() => triggerProcessing(job.id));
+      after(() => kickProcessing(job.id));
     }
     await audit({
       userId: user.id,
